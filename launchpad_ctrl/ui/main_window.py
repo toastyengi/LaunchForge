@@ -1070,45 +1070,84 @@ class MainWindow(QMainWindow):
 
     def _on_vmic_disable(self):
         """Disable the virtual microphone and restore normal output."""
+        self.audio.stop()
         self.virtual_mic.teardown()
+
+        # Give PipeWire time to unregister, then force PortAudio re-enum
+        time.sleep(0.3)
+        if SD_AVAILABLE:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
+
+        # Restart on the system default device
+        sd.default.device = [None, None]
+        self.audio.start()
+
         self._vmic_status.setText("Status: Inactive")
         self._vmic_status.setStyleSheet("")
         self._vmic_enable_btn.setEnabled(True)
         self._vmic_disable_btn.setEnabled(False)
-
-        # Refresh the sounddevice device list and restore normal output
         self._refresh_audio_devices()
         self._statusbar.showMessage("Virtual mic disabled — normal output restored")
 
     def _set_output_to_virtual_sink(self):
-        """Switch the LaunchForge audio output to the virtual sink."""
+        """Switch the LaunchForge audio output to the virtual sink.
+
+        After pactl creates new sinks, PortAudio (which sounddevice wraps)
+        won't see them because it enumerates devices only at Pa_Initialize().
+        We must stop the stream, re-init PortAudio, find the new device, and
+        restart.
+        """
         if not SD_AVAILABLE:
             return
-        # Find the virtual sink in the sounddevice device list
+
+        # Give PipeWire/PulseAudio a moment to register new devices
+        time.sleep(0.3)
+
+        # Stop the current audio stream before re-initialising PortAudio
+        self.audio.stop()
+
+        # Force PortAudio to re-enumerate devices
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            print(f"[VirtualMic] PortAudio re-init warning: {e}")
+
+        # Search for the virtual sink in the refreshed device list
+        target_idx = None
         try:
             devices = sd.query_devices()
             for i, d in enumerate(devices):
                 if d["max_output_channels"] > 0 and VirtualMicSink.SINK_NAME in d["name"]:
-                    AudioDevice.set_output_device(i)
-                    self.audio.restart()
-
-                    # Update the output combo to reflect the change
-                    self._output_combo.blockSignals(True)
-                    self._refresh_audio_devices()
-                    for j in range(self._output_combo.count()):
-                        if self._output_combo.itemData(j) == i:
-                            self._output_combo.setCurrentIndex(j)
-                            break
-                    self._output_combo.blockSignals(False)
-
-                    print(f"[VirtualMic] Output switched to {d['name']}")
-                    return
+                    target_idx = i
+                    break
         except Exception as e:
-            print(f"[VirtualMic] Could not auto-switch output device: {e}")
+            print(f"[VirtualMic] Device query error: {e}")
 
-        print("[VirtualMic] Note: could not find virtual sink in sounddevice. "
-              "You may need to manually select it from the Output Device dropdown "
-              "after clicking 'Refresh Devices'.")
+        if target_idx is not None:
+            AudioDevice.set_output_device(target_idx)
+            self.audio.start()
+
+            # Refresh the combo and select the virtual sink
+            self._refresh_audio_devices()
+            self._output_combo.blockSignals(True)
+            for j in range(self._output_combo.count()):
+                if self._output_combo.itemData(j) == target_idx:
+                    self._output_combo.setCurrentIndex(j)
+                    break
+            self._output_combo.blockSignals(False)
+            print(f"[VirtualMic] Output switched to device index {target_idx}")
+        else:
+            # Restart audio on whatever device was set before
+            self.audio.start()
+            self._refresh_audio_devices()
+            print("[VirtualMic] Could not find virtual sink in sounddevice. "
+                  "Please manually select it from the Output Device dropdown "
+                  "after clicking 'Refresh Devices'.")
 
     # --- MIDI Connection ---
 
