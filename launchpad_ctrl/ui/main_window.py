@@ -648,6 +648,43 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self._rec_status)
 
+        if state == RecState.ASSIGNING and self._recorder.has_pending_recording:
+            trim_group = QGroupBox("Trim Pending Recording")
+            trim_layout = QVBoxLayout(trim_group)
+
+            duration = self._recorder.pending_duration
+            trim_info = QLabel(
+                f"Original: {duration:.2f}s • Selected: {self._recorder.trim_duration:.2f}s"
+            )
+            trim_info.setStyleSheet("color: #aaa; font-size: 10px;")
+            trim_layout.addWidget(trim_info)
+
+            start_row = QHBoxLayout()
+            start_row.addWidget(QLabel("Start"))
+            start_slider = QSlider(Qt.Horizontal)
+            start_slider.setRange(0, int(duration * 1000))
+            start_slider.setValue(int(self._recorder.trim_start_sec * 1000))
+            start_slider.valueChanged.connect(self._on_trim_start_changed)
+            start_row.addWidget(start_slider)
+            start_label = QLabel(f"{self._recorder.trim_start_sec:.2f}s")
+            start_label.setMinimumWidth(52)
+            start_row.addWidget(start_label)
+            trim_layout.addLayout(start_row)
+
+            end_row = QHBoxLayout()
+            end_row.addWidget(QLabel("End"))
+            end_slider = QSlider(Qt.Horizontal)
+            end_slider.setRange(0, int(duration * 1000))
+            end_slider.setValue(int(self._recorder.trim_end_sec * 1000))
+            end_slider.valueChanged.connect(self._on_trim_end_changed)
+            end_row.addWidget(end_slider)
+            end_label = QLabel(f"{self._recorder.trim_end_sec:.2f}s")
+            end_label.setMinimumWidth(52)
+            end_row.addWidget(end_label)
+            trim_layout.addLayout(end_row)
+
+            layout.addWidget(trim_group)
+
         # Contextual instructions
         if state == RecState.IDLE:
             info = QLabel(
@@ -936,6 +973,20 @@ class MainWindow(QMainWindow):
         self._recorder.discard_pending()
         self._rebuild_mode_controls()
         self._statusbar.showMessage("Recording discarded.")
+
+    def _on_trim_start_changed(self, value: int):
+        if not self._recorder.has_pending_recording:
+            return
+        start_sec = value / 1000.0
+        self._recorder.set_trim(start_sec, self._recorder.trim_end_sec)
+        self._rebuild_mode_controls()
+
+    def _on_trim_end_changed(self, value: int):
+        if not self._recorder.has_pending_recording:
+            return
+        end_sec = value / 1000.0
+        self._recorder.set_trim(self._recorder.trim_start_sec, end_sec)
+        self._rebuild_mode_controls()
 
     def _import_to_recorder_pad(self):
         """Import an audio file directly to the currently selected pad."""
