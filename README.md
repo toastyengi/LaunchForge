@@ -6,8 +6,6 @@ A modular MIDI controller application for the **Novation Launchpad Mini Mk2** on
 
 ---
 
-<img width="1254" height="987" alt="image" src="https://github.com/user-attachments/assets/cb139f13-760b-404a-a682-af7c7cb69750" />
-
 ## Features
 
 ### 🎵 Step Sequencer
@@ -30,6 +28,8 @@ A modular MIDI controller application for the **Novation Launchpad Mini Mk2** on
 - Press a pad to assign the recording to it
 - Import existing audio files to pads
 - Preview recordings by pressing assigned pads
+
+<img width="1254" height="987" alt="image" src="https://github.com/user-attachments/assets/cb139f13-760b-404a-a682-af7c7cb69750" />
 
 ### 🎛️ Global Controls (Top Row Buttons)
 | Button | Function |
