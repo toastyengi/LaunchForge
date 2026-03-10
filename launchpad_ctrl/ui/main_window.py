@@ -408,16 +408,14 @@ class MainWindow(QMainWindow):
     # --- Transport ---
 
     def _on_play(self):
-        mode = self.mode_manager.current_mode
-        if isinstance(mode, StepSequencerMode):
-            mode.toggle_playback()
-            self._play_btn.setText("⏸ PAUSE" if mode.playing else "▶ PLAY")
+        # Always toggle the sequencer so it can play in the background
+        self._sequencer.toggle_playback()
+        self._play_btn.setText("⏸ PAUSE" if self._sequencer.playing else "▶ PLAY")
 
     def _on_stop(self):
-        mode = self.mode_manager.current_mode
-        if isinstance(mode, StepSequencerMode):
-            mode.stop_playback()
-            self._play_btn.setText("▶ PLAY")
+        # Always stop the sequencer (it may be playing in the background)
+        self._sequencer.stop_playback()
+        self._play_btn.setText("▶ PLAY")
         self.audio.stop_all()
 
     def _on_record_toggle(self):
@@ -457,9 +455,9 @@ class MainWindow(QMainWindow):
     def _on_panic(self):
         """Stop all sounds immediately."""
         self.audio.stop_all()
-        if isinstance(self.mode_manager.current_mode, StepSequencerMode):
-            self._sequencer.stop_playback()
-            self._play_btn.setText("▶ PLAY")
+        # Always stop sequencer (it may be playing in the background)
+        self._sequencer.stop_playback()
+        self._play_btn.setText("▶ PLAY")
         if isinstance(self.mode_manager.current_mode, SoundboardMode):
             self._soundboard.stop_all_sounds()
         self._statusbar.showMessage("All sounds stopped")
@@ -474,6 +472,8 @@ class MainWindow(QMainWindow):
         for n, btn in self._mode_buttons.items():
             btn.setChecked(n == name)
         self._rebuild_mode_controls()
+        # Keep play button in sync with sequencer state (it may be running in background)
+        self._play_btn.setText("⏸ PAUSE" if self._sequencer.playing else "▶ PLAY")
         self._statusbar.showMessage(f"Mode: {name}")
         self._update_grid_display()
 
@@ -1359,6 +1359,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up on window close."""
+        # Stop sequencer thread (may be running in the background)
+        self._sequencer.stop_playback()
         self.midi.clear_all()
         self.midi.disconnect()
         self.audio.stop()
