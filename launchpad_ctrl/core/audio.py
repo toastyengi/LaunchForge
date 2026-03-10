@@ -34,6 +34,30 @@ class AudioDevice:
     """Manages audio device selection and enumeration."""
 
     @staticmethod
+    def list_all_devices() -> List[Dict]:
+        """List all audio devices (input, output, and duplex)."""
+        if not SD_AVAILABLE:
+            return []
+        devices = sd.query_devices()
+        result = []
+        for i, d in enumerate(devices):
+            kind = []
+            if d["max_input_channels"] > 0:
+                kind.append("In")
+            if d["max_output_channels"] > 0:
+                kind.append("Out")
+            if kind:
+                result.append({
+                    "index": i,
+                    "name": d["name"],
+                    "kind": "/".join(kind),
+                    "max_output_channels": d["max_output_channels"],
+                    "max_input_channels": d["max_input_channels"],
+                    "samplerate": d["default_samplerate"],
+                })
+        return result
+
+    @staticmethod
     def list_input_devices() -> List[Dict]:
         if not SD_AVAILABLE:
             return []

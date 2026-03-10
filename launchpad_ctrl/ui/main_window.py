@@ -257,9 +257,11 @@ class MainWindow(QMainWindow):
         loop_dev_label = QLabel("Loopback Device:")
         loop_layout.addWidget(loop_dev_label)
         self._loopback_combo = QComboBox()
-        self._loopback_combo.setToolTip("Select the output device to mirror audio to")
+        self._loopback_combo.setToolTip(
+            "Select the device to mirror audio to.\n"
+            "All available audio devices are listed."
+        )
         self._loopback_combo.currentIndexChanged.connect(self._on_loopback_device_changed)
-        self._loopback_combo.setEnabled(False)
         loop_layout.addWidget(self._loopback_combo)
         layout.addWidget(loop_group)
 
@@ -907,11 +909,18 @@ class MainWindow(QMainWindow):
         outputs = AudioDevice.list_output_devices()
         for dev in outputs:
             self._output_combo.addItem(f"{dev['name']}", dev["index"])
-            self._loopback_combo.addItem(f"{dev['name']}", dev["index"])
 
         inputs = AudioDevice.list_input_devices()
         for dev in inputs:
             self._input_combo.addItem(f"{dev['name']}", dev["index"])
+
+        # Loopback lists all devices so virtual cables (which may register
+        # as input-only, output-only, or duplex) are always visible.
+        all_devs = AudioDevice.list_all_devices()
+        for dev in all_devs:
+            self._loopback_combo.addItem(
+                f"{dev['name']}  [{dev['kind']}]", dev["index"]
+            )
 
         # Select the current default device in the combo without triggering a change
         defaults = AudioDevice.get_default_devices()
@@ -953,7 +962,6 @@ class MainWindow(QMainWindow):
 
     def _on_loopback_toggled(self, state):
         enabled = state == Qt.Checked
-        self._loopback_combo.setEnabled(enabled)
         if enabled:
             index = self._loopback_combo.currentIndex()
             if index >= 0:
