@@ -40,6 +40,14 @@ RECORDINGS_DIR = os.path.join(CONFIG_DIR, "recordings")
 class MainWindow(QMainWindow):
     """Main application window."""
 
+    # Thread-safe signals: MIDI callbacks fire from the listener thread,
+    # so we marshal them to the main Qt thread via queued signals.
+    _sig_midi_grid_press = pyqtSignal(int, int)
+    _sig_midi_grid_release = pyqtSignal(int, int)
+    _sig_midi_control_press = pyqtSignal(str, int)
+    _sig_midi_control_release = pyqtSignal(str, int)
+    _sig_ui_update = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LaunchPad Controller")
@@ -69,6 +77,13 @@ class MainWindow(QMainWindow):
         self._soundboard.set_ui_callback(self._on_ui_update)
         self._recorder.set_ui_callback(self._on_ui_update)
         self.mode_manager.set_mode_change_callback(self._on_mode_changed)
+
+        # Connect thread-safe signals to main-thread handlers
+        self._sig_midi_grid_press.connect(self._on_midi_grid_press)
+        self._sig_midi_grid_release.connect(self._on_midi_grid_release)
+        self._sig_midi_control_press.connect(self._on_midi_control_press)
+        self._sig_midi_control_release.connect(self._on_midi_control_release)
+        self._sig_ui_update.connect(self._handle_ui_update)
 
         # Apply theme
         self.setStyleSheet(DARK_THEME)
@@ -314,12 +329,16 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
     def _setup_midi_callbacks(self):
-        """Wire MIDI events to mode manager and control buttons."""
+        """Wire MIDI events via Qt signals for thread-safe dispatch.
+
+        MIDI callbacks fire from the listener thread; emitting queued signals
+        ensures all UI and mode-manager work runs on the main Qt thread.
+        """
         self.midi.set_callbacks(
-            on_grid_press=self._on_midi_grid_press,
-            on_grid_release=self._on_midi_grid_release,
-            on_control_press=self._on_midi_control_press,
-            on_control_release=self._on_midi_control_release,
+            on_grid_press=lambda row, col: self._sig_midi_grid_press.emit(row, col),
+            on_grid_release=lambda row, col: self._sig_midi_grid_release.emit(row, col),
+            on_control_press=lambda pos, idx: self._sig_midi_control_press.emit(pos, idx),
+            on_control_release=lambda pos, idx: self._sig_midi_control_release.emit(pos, idx),
         )
 
     def _setup_timers(self):
@@ -853,6 +872,11 @@ class MainWindow(QMainWindow):
     # --- Audio Device Handling ---
 
     def _refresh_audio_devices(self):
+        # Block signals while populating to avoid overriding the system
+        # default output device before the audio stream is started.
+        self._output_combo.blockSignals(True)
+        self._input_combo.blockSignals(True)
+
         self._output_combo.clear()
         self._input_combo.clear()
 
@@ -864,11 +888,29 @@ class MainWindow(QMainWindow):
         for dev in inputs:
             self._input_combo.addItem(f"{dev['name']}", dev["index"])
 
+        # Select the current default device in the combo without triggering a change
+        defaults = AudioDevice.get_default_devices()
+        if defaults[1] is not None:
+            for i in range(self._output_combo.count()):
+                if self._output_combo.itemData(i) == defaults[1]:
+                    self._output_combo.setCurrentIndex(i)
+                    break
+        if defaults[0] is not None:
+            for i in range(self._input_combo.count()):
+                if self._input_combo.itemData(i) == defaults[0]:
+                    self._input_combo.setCurrentIndex(i)
+                    break
+
+        self._output_combo.blockSignals(False)
+        self._input_combo.blockSignals(False)
+
     def _on_output_device_changed(self, index):
         if index >= 0:
             dev_index = self._output_combo.itemData(index)
             if dev_index is not None:
                 AudioDevice.set_output_device(dev_index)
+                # Restart the audio stream so it uses the newly selected device
+                self.audio.restart()
                 self._statusbar.showMessage(f"Output: {self._output_combo.currentText()}")
 
     def _on_input_device_changed(self, index):
@@ -1209,7 +1251,16 @@ class MainWindow(QMainWindow):
                 self._bpm_spin.blockSignals(False)
 
     def _on_ui_update(self):
-        """Called by modes when they want to trigger a UI refresh."""
+        """Called by modes when they want to trigger a UI refresh.
+
+        This may be called from any thread (MIDI listener, sequencer playback,
+        or the main thread), so we emit a queued signal to ensure all widget
+        work happens on the main Qt thread.
+        """
+        self._sig_ui_update.emit()
+
+    def _handle_ui_update(self):
+        """Process a UI refresh request on the main Qt thread."""
         self._update_grid_display()
         # Rebuild recorder controls when state changes (recording started/stopped/assigned)
         if isinstance(self.mode_manager.current_mode, RecorderMode):
