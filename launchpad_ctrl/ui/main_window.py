@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QAction, QMessageBox, QSplitter, QFrame, QTabWidget,
     QScrollArea, QLineEdit, QSizePolicy, QApplication
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
 from PyQt5.QtGui import QFont, QIcon
 
 from launchpad_ctrl.ui.grid_widget import LaunchpadGrid
@@ -35,6 +35,16 @@ else:
     CONFIG_DIR = os.path.expanduser("~/.launchpad-ctrl")
 PROJECTS_DIR = os.path.join(CONFIG_DIR, "projects")
 RECORDINGS_DIR = os.path.join(CONFIG_DIR, "recordings")
+
+
+class _FixedComboBox(QComboBox):
+    """QComboBox subclass that fixes popup positioning on KDE Plasma."""
+
+    def showPopup(self):
+        super().showPopup()
+        popup = self.view().window()
+        pos = self.mapToGlobal(QPoint(0, self.height()))
+        popup.move(pos)
 
 
 class MainWindow(QMainWindow):
@@ -229,7 +239,7 @@ class MainWindow(QMainWindow):
         # Output device
         out_group = QGroupBox("Output Device")
         out_layout = QVBoxLayout(out_group)
-        self._output_combo = QComboBox()
+        self._output_combo = _FixedComboBox()
         self._output_combo.currentIndexChanged.connect(self._on_output_device_changed)
         out_layout.addWidget(self._output_combo)
         layout.addWidget(out_group)
@@ -237,7 +247,7 @@ class MainWindow(QMainWindow):
         # Input device
         in_group = QGroupBox("Input Device")
         in_layout = QVBoxLayout(in_group)
-        self._input_combo = QComboBox()
+        self._input_combo = _FixedComboBox()
         self._input_combo.currentIndexChanged.connect(self._on_input_device_changed)
         in_layout.addWidget(self._input_combo)
         layout.addWidget(in_group)
@@ -261,11 +271,11 @@ class MainWindow(QMainWindow):
         conn_group = QGroupBox("MIDI Connection")
         conn_layout = QVBoxLayout(conn_group)
 
-        self._midi_input_combo = QComboBox()
+        self._midi_input_combo = _FixedComboBox()
         conn_layout.addWidget(QLabel("MIDI Input:"))
         conn_layout.addWidget(self._midi_input_combo)
 
-        self._midi_output_combo = QComboBox()
+        self._midi_output_combo = _FixedComboBox()
         conn_layout.addWidget(QLabel("MIDI Output:"))
         conn_layout.addWidget(self._midi_output_combo)
 
@@ -590,7 +600,7 @@ class MainWindow(QMainWindow):
         # Color selector
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel("Color:"))
-        self._sb_color_combo = QComboBox()
+        self._sb_color_combo = _FixedComboBox()
         for name in LPColor.names():
             if name != "off":
                 self._sb_color_combo.addItem(name)
