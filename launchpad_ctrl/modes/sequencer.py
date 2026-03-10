@@ -62,10 +62,15 @@ class StepSequencerMode(BaseMode):
     def activate(self):
         super().activate()
         self._update_right_column()
+        # If playback was running in the background, refresh LEDs to show
+        # the current playhead position now that we own the grid again.
+        if self._playing:
+            self.refresh_leds()
 
     def deactivate(self):
-        self.stop_playback()
-        super().deactivate()
+        # Keep playback running in the background so the sequence
+        # continues while the user is on another mode (e.g. soundboard).
+        self._active = False
 
     def cleanup(self):
         self.stop_playback()
@@ -167,8 +172,9 @@ class StepSequencerMode(BaseMode):
             self._tick_thread.join(timeout=2)
             self._tick_thread = None
         self._playhead = 0
-        self.refresh_leds()
-        self.notify_ui()
+        if self._active:
+            self.refresh_leds()
+            self.notify_ui()
 
     def toggle_playback(self):
         if self._playing:
@@ -183,8 +189,10 @@ class StepSequencerMode(BaseMode):
 
             # Trigger sounds for the current column
             self._trigger_column(self._playhead)
-            self.refresh_leds()
-            self.notify_ui()
+            # Only update LEDs/grid when this mode owns the Launchpad
+            if self._active:
+                self.refresh_leds()
+                self.notify_ui()
 
             # Wait for next step
             next_time = self._last_tick_time + step_duration
