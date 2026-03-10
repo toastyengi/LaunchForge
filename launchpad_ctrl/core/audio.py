@@ -229,6 +229,14 @@ class AudioEngine:
         except Exception as e:
             print(f"[Audio] Failed to start: {e}")
 
+    def restart(self):
+        """Restart the audio output stream (e.g., after device change)."""
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        self.start()
+
     def stop(self):
         """Stop the audio engine."""
         self.stop_all()
