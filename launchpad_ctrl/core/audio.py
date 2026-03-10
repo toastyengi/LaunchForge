@@ -4,6 +4,7 @@ Supports WAV, OGG, and MP3 (via pydub/ffmpeg).
 """
 
 import os
+import subprocess
 import threading
 import time
 import json
@@ -70,6 +71,224 @@ class AudioDevice:
         if SD_AVAILABLE:
             return sd.default.device
         return [None, None]
+
+
+class VirtualMicSink:
+    """Manages a PipeWire/PulseAudio virtual microphone sink.
+
+    Creates a virtual audio sink whose monitor acts as an input (microphone)
+    device. When enabled, the AudioEngine writes its mixed output into this
+    sink so that applications like Discord or games can capture LaunchForge
+    audio as if it were coming from a microphone.
+
+    Requires ``pactl`` (PulseAudio / PipeWire-Pulse) to be available.
+    """
+
+    DEFAULT_SINK_NAME = "LaunchForge_VirtualMic"
+    DEFAULT_DESCRIPTION = "LaunchForge Virtual Microphone"
+
+    def __init__(self, sink_name: str = DEFAULT_SINK_NAME,
+                 description: str = DEFAULT_DESCRIPTION,
+                 samplerate: int = 44100, channels: int = 2):
+        self.sink_name = sink_name
+        self.description = description
+        self.samplerate = samplerate
+        self.channels = channels
+        self._module_id: Optional[int] = None
+        self._stream = None  # sounddevice OutputStream writing to the sink
+        self._lock = threading.Lock()
+        self._active = False
+        self._monitor_source_name = f"{sink_name}.monitor"
+
+    # ------------------------------------------------------------------
+    # Availability check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_supported() -> bool:
+        """Return True if pactl is available on this system."""
+        try:
+            result = subprocess.run(
+                ["pactl", "--version"],
+                capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    # ------------------------------------------------------------------
+    # Sink lifecycle
+    # ------------------------------------------------------------------
+
+    def create(self) -> bool:
+        """Load a null-sink PulseAudio module and return True on success."""
+        if self._module_id is not None:
+            return True  # already loaded
+
+        try:
+            result = subprocess.run(
+                [
+                    "pactl", "load-module", "module-null-sink",
+                    f"sink_name={self.sink_name}",
+                    f"sink_properties=device.description=\"{self.description}\"",
+                    f"rate={self.samplerate}",
+                    f"channels={self.channels}",
+                    "format=float32le",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self._module_id = int(result.stdout.strip())
+                print(f"[VirtualMic] Created sink (module {self._module_id})")
+                return True
+            else:
+                print(f"[VirtualMic] pactl error: {result.stderr.strip()}")
+                return False
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError) as e:
+            print(f"[VirtualMic] Failed to create sink: {e}")
+            return False
+
+    def destroy(self) -> bool:
+        """Unload the null-sink module. Returns True on success."""
+        self.stop_stream()
+        if self._module_id is None:
+            return True
+
+        try:
+            result = subprocess.run(
+                ["pactl", "unload-module", str(self._module_id)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                print(f"[VirtualMic] Destroyed sink (module {self._module_id})")
+                self._module_id = None
+                return True
+            else:
+                print(f"[VirtualMic] Unload error: {result.stderr.strip()}")
+                return False
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"[VirtualMic] Failed to destroy sink: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Audio stream that feeds the virtual sink
+    # ------------------------------------------------------------------
+
+    def start_stream(self, audio_callback):
+        """Open an OutputStream targeting the virtual sink.
+
+        ``audio_callback`` must have the same signature as a sounddevice
+        OutputStream callback: ``(outdata, frames, time_info, status)``.
+        The caller is responsible for filling *outdata* with the mixed audio.
+        """
+        if not SD_AVAILABLE:
+            print("[VirtualMic] sounddevice not available")
+            return
+        if self._module_id is None:
+            print("[VirtualMic] Sink not created — call create() first")
+            return
+
+        # Find the device index for our virtual sink
+        sink_index = self._find_sink_device_index()
+        if sink_index is None:
+            print("[VirtualMic] Could not find virtual sink device in sounddevice")
+            return
+
+        with self._lock:
+            if self._stream is not None:
+                return  # already running
+
+            try:
+                self._stream = sd.OutputStream(
+                    samplerate=self.samplerate,
+                    blocksize=512,
+                    channels=self.channels,
+                    dtype="float32",
+                    device=sink_index,
+                    callback=audio_callback,
+                )
+                self._stream.start()
+                self._active = True
+                print(f"[VirtualMic] Stream started (device {sink_index})")
+            except Exception as e:
+                print(f"[VirtualMic] Stream start error: {e}")
+                self._stream = None
+
+    def stop_stream(self):
+        """Stop the output stream to the virtual sink."""
+        with self._lock:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+                self._active = False
+                print("[VirtualMic] Stream stopped")
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def monitor_source(self) -> str:
+        """PulseAudio monitor source name for other apps to use as mic."""
+        return self._monitor_source_name
+
+    # ------------------------------------------------------------------
+    # List available virtual sinks already loaded in the system
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_virtual_sinks() -> List[Dict]:
+        """Return a list of currently loaded null-sink modules."""
+        sinks: List[Dict] = []
+        try:
+            result = subprocess.run(
+                ["pactl", "list", "sinks", "short"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        sinks.append({
+                            "index": parts[0],
+                            "name": parts[1],
+                            "driver": parts[2] if len(parts) > 2 else "",
+                        })
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return sinks
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _find_sink_device_index(self) -> Optional[int]:
+        """Find the sounddevice output index matching our virtual sink."""
+        if not SD_AVAILABLE:
+            return None
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d["max_output_channels"] > 0 and self.sink_name in d["name"]:
+                return i
+        return None
+
+    def get_monitor_device_index(self) -> Optional[int]:
+        """Find the sounddevice *input* index for our monitor source.
+
+        Other parts of the app (or the user) can select this as their
+        microphone input device.
+        """
+        if not SD_AVAILABLE:
+            return None
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] > 0 and self.sink_name in d["name"]:
+                return i
+        return None
 
 
 class SoundLoader:
@@ -202,6 +421,15 @@ class AudioEngine:
         self._lock = threading.Lock()
         self._on_record_complete: Optional[Callable] = None
 
+        # Virtual microphone sink — shares mixed audio with a virtual device
+        self._virtual_mic: Optional[VirtualMicSink] = None
+        self._virtual_mic_enabled = False
+        # Ring buffer exchanged between the main callback and the sink callback
+        self._vmic_buffer: Optional[np.ndarray] = None
+        self._vmic_write_pos = 0
+        self._vmic_read_pos = 0
+        self._vmic_buf_lock = threading.Lock()
+
     @property
     def master_volume(self):
         return self._master_volume
@@ -239,6 +467,7 @@ class AudioEngine:
 
     def stop(self):
         """Stop the audio engine."""
+        self.disable_virtual_mic()
         self.stop_all()
         if self._stream:
             self._stream.stop()
@@ -249,6 +478,74 @@ class AudioEngine:
             self._record_stream.close()
             self._record_stream = None
         print("[Audio] Engine stopped")
+
+    # --- Virtual Microphone Sink ---
+
+    def enable_virtual_mic(self) -> bool:
+        """Create a virtual mic sink and start routing mixed audio to it.
+
+        Returns True if the virtual mic was successfully enabled.
+        """
+        if self._virtual_mic_enabled:
+            return True
+
+        if not VirtualMicSink.is_supported():
+            print("[Audio] Virtual mic not supported (pactl not found)")
+            return False
+
+        vmic = VirtualMicSink(
+            samplerate=self.samplerate,
+            channels=2,
+        )
+        if not vmic.create():
+            return False
+
+        # Allocate a ring buffer (~1 second of audio)
+        buf_frames = self.samplerate
+        self._vmic_buffer = np.zeros((buf_frames, 2), dtype=np.float32)
+        self._vmic_write_pos = 0
+        self._vmic_read_pos = 0
+
+        vmic.start_stream(self._vmic_playback_callback)
+        self._virtual_mic = vmic
+        self._virtual_mic_enabled = True
+        print("[Audio] Virtual microphone enabled")
+        return True
+
+    def disable_virtual_mic(self):
+        """Tear down the virtual mic sink."""
+        if not self._virtual_mic_enabled:
+            return
+        self._virtual_mic_enabled = False
+        if self._virtual_mic is not None:
+            self._virtual_mic.stop_stream()
+            self._virtual_mic.destroy()
+            self._virtual_mic = None
+        self._vmic_buffer = None
+        print("[Audio] Virtual microphone disabled")
+
+    @property
+    def virtual_mic_active(self) -> bool:
+        return self._virtual_mic_enabled
+
+    @property
+    def virtual_mic_monitor_source(self) -> Optional[str]:
+        """Name of the PulseAudio monitor source for the virtual mic."""
+        if self._virtual_mic is not None:
+            return self._virtual_mic.monitor_source
+        return None
+
+    def _vmic_playback_callback(self, outdata, frames, time_info, status):
+        """Callback for the OutputStream that feeds the virtual sink."""
+        if not self._virtual_mic_enabled or self._vmic_buffer is None:
+            outdata[:] = np.zeros((frames, 2), dtype=np.float32)
+            return
+
+        with self._vmic_buf_lock:
+            buf_len = len(self._vmic_buffer)
+            for i in range(frames):
+                outdata[i] = self._vmic_buffer[self._vmic_read_pos]
+                self._vmic_read_pos = (self._vmic_read_pos + 1) % buf_len
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Audio stream callback - mixes all active playback instances."""
@@ -268,6 +565,14 @@ class AudioEngine:
         # Clip to prevent distortion
         np.clip(output, -1.0, 1.0, out=output)
         outdata[:] = output
+
+        # Feed virtual mic ring buffer if active
+        if self._virtual_mic_enabled and self._vmic_buffer is not None:
+            with self._vmic_buf_lock:
+                buf_len = len(self._vmic_buffer)
+                for i in range(frames):
+                    self._vmic_buffer[self._vmic_write_pos] = output[i]
+                    self._vmic_write_pos = (self._vmic_write_pos + 1) % buf_len
 
     def play_sound(self, filepath: str, volume: float = 1.0, loop: bool = False) -> Optional[int]:
         """Play a sound file. Returns playback instance ID."""

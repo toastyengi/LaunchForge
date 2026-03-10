@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont, QIcon
 from launchpad_ctrl.ui.grid_widget import LaunchpadGrid
 from launchpad_ctrl.ui.theme import DARK_THEME
 from launchpad_ctrl.core import LaunchpadMIDI, LPColor
-from launchpad_ctrl.core.audio import AudioEngine, AudioDevice
+from launchpad_ctrl.core.audio import AudioEngine, AudioDevice, VirtualMicSink
 from launchpad_ctrl.modes import ModeManager
 from launchpad_ctrl.modes.sequencer import StepSequencerMode
 from launchpad_ctrl.modes.soundboard import SoundboardMode, PadConfig
@@ -241,6 +241,39 @@ class MainWindow(QMainWindow):
         self._input_combo.currentIndexChanged.connect(self._on_input_device_changed)
         in_layout.addWidget(self._input_combo)
         layout.addWidget(in_group)
+
+        # Virtual Microphone Sink
+        vmic_group = QGroupBox("Virtual Microphone Sink")
+        vmic_layout = QVBoxLayout(vmic_group)
+
+        vmic_desc = QLabel(
+            "Route LaunchForge audio to a virtual microphone so "
+            "Discord, games, and other apps can capture it as mic input."
+        )
+        vmic_desc.setWordWrap(True)
+        vmic_desc.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        vmic_layout.addWidget(vmic_desc)
+
+        self._vmic_toggle_btn = QPushButton("Enable Virtual Mic")
+        self._vmic_toggle_btn.setCheckable(True)
+        self._vmic_toggle_btn.clicked.connect(self._on_vmic_toggle)
+        vmic_layout.addWidget(self._vmic_toggle_btn)
+
+        self._vmic_status_label = QLabel("Status: Inactive")
+        self._vmic_status_label.setStyleSheet("color: #888888;")
+        vmic_layout.addWidget(self._vmic_status_label)
+
+        self._vmic_source_label = QLabel("")
+        self._vmic_source_label.setWordWrap(True)
+        self._vmic_source_label.setStyleSheet("color: #888888; font-size: 10px;")
+        vmic_layout.addWidget(self._vmic_source_label)
+
+        if not VirtualMicSink.is_supported():
+            self._vmic_toggle_btn.setEnabled(False)
+            self._vmic_status_label.setText("Status: Not supported (pactl not found)")
+            self._vmic_status_label.setStyleSheet("color: #ff4444;")
+
+        layout.addWidget(vmic_group)
 
         # Refresh button
         refresh_btn = QPushButton("Refresh Devices")
@@ -924,6 +957,38 @@ class MainWindow(QMainWindow):
     def _on_master_volume(self, value):
         self.audio.master_volume = value / 100.0
         self._vol_label.setText(f"{value}%")
+
+    # --- Virtual Microphone Sink ---
+
+    def _on_vmic_toggle(self, checked: bool):
+        """Enable or disable the virtual microphone sink."""
+        if checked:
+            ok = self.audio.enable_virtual_mic()
+            if ok:
+                self._vmic_toggle_btn.setText("Disable Virtual Mic")
+                self._vmic_status_label.setText("Status: Active")
+                self._vmic_status_label.setStyleSheet("color: #44ff44;")
+                source = self.audio.virtual_mic_monitor_source or "LaunchForge_VirtualMic.monitor"
+                self._vmic_source_label.setText(
+                    f"Select \"{source}\" as your microphone in Discord / game settings."
+                )
+                self._statusbar.showMessage("Virtual microphone enabled")
+                # Refresh devices so the new virtual device appears in the
+                # input device list as well.
+                self._refresh_audio_devices()
+            else:
+                self._vmic_toggle_btn.setChecked(False)
+                self._vmic_status_label.setText("Status: Failed to create sink")
+                self._vmic_status_label.setStyleSheet("color: #ff4444;")
+                self._statusbar.showMessage("Failed to enable virtual microphone")
+        else:
+            self.audio.disable_virtual_mic()
+            self._vmic_toggle_btn.setText("Enable Virtual Mic")
+            self._vmic_status_label.setText("Status: Inactive")
+            self._vmic_status_label.setStyleSheet("color: #888888;")
+            self._vmic_source_label.setText("")
+            self._statusbar.showMessage("Virtual microphone disabled")
+            self._refresh_audio_devices()
 
     # --- MIDI Connection ---
 
