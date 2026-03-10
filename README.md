@@ -1,4 +1,4 @@
-# Novation Launchpad Soundboard, Looper and Recorder
+# Novation Launchpad Soundboard, Sequencer and Recorder
 
 A modular MIDI controller application for the **Novation Launchpad Mini Mk2** on Arch Linux. Features a PyQt5 dark-themed GUI with a virtual grid that mirrors your physical Launchpad, multiple operational modes, mic recording, and full audio device selection.
 
