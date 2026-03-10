@@ -1,4 +1,4 @@
-<img width="1254" height="987" alt="image" src="https://github.com/user-attachments/assets/0a469bd0-04cd-4d1f-90da-f4ef585c1965" /># Novation Launchpad Soundboard, Sequencer and Recorder
+# Novation Launchpad Soundboard, Sequencer and Recorder
 
 A modular MIDI controller application for the **Novation Launchpad Mini Mk2** on Arch Linux. Features a PyQt5 dark-themed GUI with a virtual grid that mirrors your physical Launchpad, multiple operational modes, mic recording, and full audio device selection.
 
