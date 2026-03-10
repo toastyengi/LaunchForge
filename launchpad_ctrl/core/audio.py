@@ -201,6 +201,12 @@ class AudioEngine:
         self._master_volume = 0.8
         self._lock = threading.Lock()
         self._on_record_complete: Optional[Callable] = None
+        # Loopback: mirror output to a secondary device (e.g. virtual cable)
+        self._loopback_enabled = False
+        self._loopback_device: Optional[int] = None
+        self._loopback_stream = None
+        self._loopback_buffer: List[np.ndarray] = []
+        self._loopback_lock = threading.Lock()
 
     @property
     def master_volume(self):
@@ -240,6 +246,7 @@ class AudioEngine:
     def stop(self):
         """Stop the audio engine."""
         self.stop_all()
+        self._stop_loopback()
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -268,6 +275,11 @@ class AudioEngine:
         # Clip to prevent distortion
         np.clip(output, -1.0, 1.0, out=output)
         outdata[:] = output
+
+        # Feed output to loopback device if enabled
+        if self._loopback_enabled and self._loopback_stream is not None:
+            with self._loopback_lock:
+                self._loopback_buffer.append(output.copy())
 
     def play_sound(self, filepath: str, volume: float = 1.0, loop: bool = False) -> Optional[int]:
         """Play a sound file. Returns playback instance ID."""
@@ -339,6 +351,78 @@ class AudioEngine:
     def active_count(self) -> int:
         with self._lock:
             return len(self._playback_instances)
+
+    # --- Loopback ---
+
+    def _loopback_callback(self, outdata, frames, time_info, status):
+        """Loopback stream callback - writes buffered output to the loopback device."""
+        with self._loopback_lock:
+            if self._loopback_buffer:
+                chunk = self._loopback_buffer.pop(0)
+                # Handle frame size mismatch
+                if len(chunk) >= frames:
+                    outdata[:] = chunk[:frames]
+                else:
+                    outdata[:len(chunk)] = chunk
+                    outdata[len(chunk):] = 0.0
+            else:
+                outdata[:] = 0.0
+
+    def set_loopback_device(self, device_index: Optional[int]):
+        """Set the target device for audio loopback."""
+        self._loopback_device = device_index
+        if self._loopback_enabled:
+            self._restart_loopback()
+
+    def set_loopback_enabled(self, enabled: bool):
+        """Enable or disable audio loopback to the selected device."""
+        self._loopback_enabled = enabled
+        if enabled:
+            self._start_loopback()
+        else:
+            self._stop_loopback()
+
+    @property
+    def loopback_enabled(self):
+        return self._loopback_enabled
+
+    def _start_loopback(self):
+        """Start the loopback output stream."""
+        if not SD_AVAILABLE or self._loopback_device is None:
+            return
+        self._stop_loopback()
+        try:
+            self._loopback_stream = sd.OutputStream(
+                samplerate=self.samplerate,
+                blocksize=self.blocksize,
+                channels=2,
+                dtype="float32",
+                device=self._loopback_device,
+                callback=self._loopback_callback,
+            )
+            self._loopback_stream.start()
+            print(f"[Audio] Loopback started -> device {self._loopback_device}")
+        except Exception as e:
+            print(f"[Audio] Failed to start loopback: {e}")
+            self._loopback_stream = None
+
+    def _stop_loopback(self):
+        """Stop the loopback output stream."""
+        if self._loopback_stream:
+            try:
+                self._loopback_stream.stop()
+                self._loopback_stream.close()
+            except Exception:
+                pass
+            self._loopback_stream = None
+        with self._loopback_lock:
+            self._loopback_buffer.clear()
+        print("[Audio] Loopback stopped")
+
+    def _restart_loopback(self):
+        """Restart loopback stream (e.g. after device change)."""
+        if self._loopback_enabled:
+            self._start_loopback()
 
     # --- Recording ---
 

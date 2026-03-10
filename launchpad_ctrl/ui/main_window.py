@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QSlider, QSpinBox, QDoubleSpinBox,
     QComboBox, QFileDialog, QGroupBox, QStatusBar, QMenuBar,
     QAction, QMessageBox, QSplitter, QFrame, QTabWidget,
-    QScrollArea, QLineEdit, QSizePolicy, QApplication
+    QScrollArea, QLineEdit, QSizePolicy, QApplication, QCheckBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
@@ -241,6 +241,27 @@ class MainWindow(QMainWindow):
         self._input_combo.currentIndexChanged.connect(self._on_input_device_changed)
         in_layout.addWidget(self._input_combo)
         layout.addWidget(in_group)
+
+        # Audio loopback
+        loop_group = QGroupBox("Audio Loopback")
+        loop_layout = QVBoxLayout(loop_group)
+        self._loopback_check = QCheckBox("Feed audio to loopback device")
+        self._loopback_check.setToolTip(
+            "Mirror all audio output to a secondary device.\n"
+            "Use with a virtual audio cable (e.g. PulseAudio, VB-Cable)\n"
+            "to feed sounds into Discord, games, or other apps."
+        )
+        self._loopback_check.stateChanged.connect(self._on_loopback_toggled)
+        loop_layout.addWidget(self._loopback_check)
+
+        loop_dev_label = QLabel("Loopback Device:")
+        loop_layout.addWidget(loop_dev_label)
+        self._loopback_combo = QComboBox()
+        self._loopback_combo.setToolTip("Select the output device to mirror audio to")
+        self._loopback_combo.currentIndexChanged.connect(self._on_loopback_device_changed)
+        self._loopback_combo.setEnabled(False)
+        loop_layout.addWidget(self._loopback_combo)
+        layout.addWidget(loop_group)
 
         # Refresh button
         refresh_btn = QPushButton("Refresh Devices")
@@ -877,13 +898,16 @@ class MainWindow(QMainWindow):
         # default output device before the audio stream is started.
         self._output_combo.blockSignals(True)
         self._input_combo.blockSignals(True)
+        self._loopback_combo.blockSignals(True)
 
         self._output_combo.clear()
         self._input_combo.clear()
+        self._loopback_combo.clear()
 
         outputs = AudioDevice.list_output_devices()
         for dev in outputs:
             self._output_combo.addItem(f"{dev['name']}", dev["index"])
+            self._loopback_combo.addItem(f"{dev['name']}", dev["index"])
 
         inputs = AudioDevice.list_input_devices()
         for dev in inputs:
@@ -896,6 +920,7 @@ class MainWindow(QMainWindow):
                 if self._output_combo.itemData(i) == defaults[1]:
                     self._output_combo.setCurrentIndex(i)
                     break
+
         if defaults[0] is not None:
             for i in range(self._input_combo.count()):
                 if self._input_combo.itemData(i) == defaults[0]:
@@ -904,6 +929,7 @@ class MainWindow(QMainWindow):
 
         self._output_combo.blockSignals(False)
         self._input_combo.blockSignals(False)
+        self._loopback_combo.blockSignals(False)
 
     def _on_output_device_changed(self, index):
         if index >= 0:
@@ -924,6 +950,28 @@ class MainWindow(QMainWindow):
     def _on_master_volume(self, value):
         self.audio.master_volume = value / 100.0
         self._vol_label.setText(f"{value}%")
+
+    def _on_loopback_toggled(self, state):
+        enabled = state == Qt.Checked
+        self._loopback_combo.setEnabled(enabled)
+        if enabled:
+            index = self._loopback_combo.currentIndex()
+            if index >= 0:
+                dev_index = self._loopback_combo.itemData(index)
+                if dev_index is not None:
+                    self.audio.set_loopback_device(dev_index)
+            self.audio.set_loopback_enabled(True)
+            self._statusbar.showMessage("Audio loopback enabled")
+        else:
+            self.audio.set_loopback_enabled(False)
+            self._statusbar.showMessage("Audio loopback disabled")
+
+    def _on_loopback_device_changed(self, index):
+        if index >= 0 and self._loopback_check.isChecked():
+            dev_index = self._loopback_combo.itemData(index)
+            if dev_index is not None:
+                self.audio.set_loopback_device(dev_index)
+                self._statusbar.showMessage(f"Loopback: {self._loopback_combo.currentText()}")
 
     # --- MIDI Connection ---
 
