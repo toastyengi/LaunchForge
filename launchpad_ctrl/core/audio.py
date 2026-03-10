@@ -283,6 +283,33 @@ class AudioEngine:
 
         return instance._id
 
+    def play_data(self, data: np.ndarray, samplerate: Optional[int] = None,
+                  volume: float = 1.0, loop: bool = False) -> Optional[int]:
+        """Play an in-memory audio buffer. Returns playback instance ID."""
+        if data is None or len(data) == 0:
+            return None
+
+        play_data = np.asarray(data, dtype=np.float32)
+        if play_data.ndim == 1:
+            play_data = np.column_stack([play_data, play_data])
+        elif play_data.shape[1] == 1:
+            play_data = np.column_stack([play_data, play_data])
+
+        source_rate = samplerate or self.samplerate
+        if source_rate != self.samplerate:
+            ratio = self.samplerate / source_rate
+            new_length = int(len(play_data) * ratio)
+            indices = np.linspace(0, len(play_data) - 1, new_length)
+            play_data = np.array([
+                np.interp(indices, np.arange(len(play_data)), play_data[:, ch])
+                for ch in range(play_data.shape[1])
+            ]).T.astype(np.float32)
+
+        instance = PlaybackInstance(play_data, self.samplerate, volume, loop)
+        with self._lock:
+            self._playback_instances[instance._id] = instance
+        return instance._id
+
     def stop_sound(self, instance_id: int):
         """Stop a specific playback instance."""
         with self._lock:

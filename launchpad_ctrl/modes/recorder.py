@@ -193,6 +193,15 @@ class RecorderMode(BaseMode):
             return None
         return self._pending_recording[start_idx:end_idx]
 
+    def preview_pending(self, trimmed: bool = True):
+        if trimmed:
+            data = self.get_trimmed_pending_recording()
+        else:
+            data = self._pending_recording
+        if data is None or len(data) == 0:
+            return None
+        return self.audio.play_data(data, samplerate=self.audio.samplerate, volume=1.0)
+
     def assign_file_to_pad(self, row: int, col: int, filepath: str):
         if os.path.exists(filepath):
             self._recordings[(row, col)] = filepath
