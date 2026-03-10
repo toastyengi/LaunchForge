@@ -4,8 +4,10 @@ Displays an 8x8 grid + control buttons, mirroring the physical Launchpad state.
 """
 
 from PyQt5.QtWidgets import QWidget, QGridLayout, QSizePolicy
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QRect, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QRect, QTimer, QUrl
 from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont, QLinearGradient
+
+SOUND_EXTENSIONS = {".wav", ".ogg", ".mp3", ".flac"}
 
 # Map Launchpad velocity colors to display RGB
 LP_COLOR_MAP = {
@@ -36,6 +38,7 @@ class PadButton(QWidget):
 
     pressed = pyqtSignal(int, int)
     released = pyqtSignal(int, int)
+    file_dropped = pyqtSignal(int, int, str)  # row, col, filepath
 
     def __init__(self, row: int, col: int, parent=None):
         super().__init__(parent)
@@ -44,10 +47,12 @@ class PadButton(QWidget):
         self._color = QColor(30, 30, 30)
         self._hover = False
         self._pressed = False
+        self._drag_hover = False
         self._label = ""
         self.setMinimumSize(48, 48)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
+        self.setAcceptDrops(True)
 
     def set_color(self, color: QColor):
         self._color = color
@@ -71,7 +76,14 @@ class PadButton(QWidget):
         r, g, b = self._color.red(), self._color.green(), self._color.blue()
         brightness = max(r, g, b)
 
-        if brightness > 60:
+        if self._drag_hover:
+            # Highlight border when dragging a file over
+            glow = QColor(100, 200, 255, 80)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(glow))
+            glow_rect = rect.adjusted(-3, -3, 3, 3)
+            p.drawRoundedRect(glow_rect, 6, 6)
+        elif brightness > 60:
             glow = QColor(r, g, b, 40)
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(glow))
@@ -81,6 +93,8 @@ class PadButton(QWidget):
         # Main pad
         if self._pressed:
             pad_color = self._color.lighter(130)
+        elif self._drag_hover:
+            pad_color = self._color.lighter(125)
         elif self._hover:
             pad_color = self._color.lighter(115)
         else:
@@ -91,7 +105,8 @@ class PadButton(QWidget):
         gradient.setColorAt(0, pad_color.lighter(110))
         gradient.setColorAt(1, pad_color.darker(110))
 
-        p.setPen(QPen(QColor(50, 50, 50), 1))
+        border_color = QColor(100, 200, 255) if self._drag_hover else QColor(50, 50, 50)
+        p.setPen(QPen(border_color, 2 if self._drag_hover else 1))
         p.setBrush(QBrush(gradient))
         p.drawRoundedRect(rect, 5, 5)
 
@@ -123,6 +138,46 @@ class PadButton(QWidget):
             self._pressed = False
             self.released.emit(self.row, self.col)
             self.update()
+
+    def _has_sound_file(self, mime_data):
+        """Check if the drag data contains a supported sound file."""
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                if url.isLocalFile():
+                    import os
+                    ext = os.path.splitext(url.toLocalFile())[1].lower()
+                    if ext in SOUND_EXTENSIONS:
+                        return True
+        return False
+
+    def dragEnterEvent(self, event):
+        if self._has_sound_file(event.mimeData()):
+            event.acceptProposedAction()
+            self._drag_hover = True
+            self.update()
+
+    def dragMoveEvent(self, event):
+        if self._has_sound_file(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._drag_hover = False
+        self.update()
+
+    def dropEvent(self, event):
+        self._drag_hover = False
+        mime = event.mimeData()
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    import os
+                    filepath = url.toLocalFile()
+                    ext = os.path.splitext(filepath)[1].lower()
+                    if ext in SOUND_EXTENSIONS:
+                        self.file_dropped.emit(self.row, self.col, filepath)
+                        event.acceptProposedAction()
+                        self.update()
+                        return
 
 
 class ControlButton(QWidget):
@@ -202,6 +257,7 @@ class LaunchpadGrid(QWidget):
 
     grid_pressed = pyqtSignal(int, int)
     grid_released = pyqtSignal(int, int)
+    grid_file_dropped = pyqtSignal(int, int, str)  # row, col, filepath
     control_pressed = pyqtSignal(str, int)
     control_released = pyqtSignal(str, int)
 
@@ -238,6 +294,7 @@ class LaunchpadGrid(QWidget):
                 pad = PadButton(row, col)
                 pad.pressed.connect(self.grid_pressed)
                 pad.released.connect(self.grid_released)
+                pad.file_dropped.connect(self.grid_file_dropped)
                 layout.addWidget(pad, row + 1, col)
                 self._pads[(row, col)] = pad
 
