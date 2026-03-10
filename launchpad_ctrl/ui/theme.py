@@ -178,8 +178,16 @@ QComboBox {
 }
 
 QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
     border: none;
     width: 20px;
+}
+
+QComboBox::down-arrow {
+    image: none;
+    width: 12px;
+    height: 12px;
 }
 
 QComboBox QAbstractItemView {
