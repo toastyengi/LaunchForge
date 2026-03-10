@@ -57,6 +57,8 @@ class RecorderMode(BaseMode):
         self._selected_pad: Optional[tuple] = None
         self._record_start_time = 0.0
         self._pending_recording: Optional[np.ndarray] = None
+        self._trim_start_sec = 0.0
+        self._trim_end_sec = 0.0
         self._last_blink = False
 
     @property
@@ -89,6 +91,24 @@ class RecorderMode(BaseMode):
     def has_pending_recording(self):
         return self._pending_recording is not None
 
+    @property
+    def pending_duration(self) -> float:
+        if self._pending_recording is None:
+            return 0.0
+        return len(self._pending_recording) / float(self.audio.samplerate)
+
+    @property
+    def trim_start_sec(self) -> float:
+        return self._trim_start_sec
+
+    @property
+    def trim_end_sec(self) -> float:
+        return self._trim_end_sec
+
+    @property
+    def trim_duration(self) -> float:
+        return max(0.0, self._trim_end_sec - self._trim_start_sec)
+
     # ---- Actions ----
 
     def start_recording(self):
@@ -105,9 +125,13 @@ class RecorderMode(BaseMode):
         data = self.audio.stop_recording()
         if data is not None and len(data) > 100:
             self._pending_recording = data
+            self._trim_start_sec = 0.0
+            self._trim_end_sec = self.pending_duration
             self._state = RecState.ASSIGNING
         else:
             self._pending_recording = None
+            self._trim_start_sec = 0.0
+            self._trim_end_sec = 0.0
             self._state = RecState.IDLE
         self.refresh_leds()
         self.notify_ui()
@@ -115,13 +139,19 @@ class RecorderMode(BaseMode):
     def assign_to_pad(self, row: int, col: int) -> bool:
         if self._pending_recording is None:
             return False
+        trimmed = self.get_trimmed_pending_recording()
+        if trimmed is None or len(trimmed) <= 100:
+            print("[Recorder] Trimmed recording is too short")
+            return False
         filename = f"rec_{row}_{col}_{int(time.time())}.wav"
         filepath = os.path.join(self._samples_dir, filename)
-        success = self.audio.save_recording(self._pending_recording, filepath)
+        success = self.audio.save_recording(trimmed, filepath)
         if success and os.path.exists(filepath):
             self._recordings[(row, col)] = filepath
             self._selected_pad = (row, col)
             self._pending_recording = None
+            self._trim_start_sec = 0.0
+            self._trim_end_sec = 0.0
             self._state = RecState.IDLE
             self.refresh_leds()
             self.notify_ui()
@@ -132,9 +162,45 @@ class RecorderMode(BaseMode):
 
     def discard_pending(self):
         self._pending_recording = None
+        self._trim_start_sec = 0.0
+        self._trim_end_sec = 0.0
         self._state = RecState.IDLE
         self.refresh_leds()
         self.notify_ui()
+
+    def set_trim(self, start_sec: float, end_sec: float):
+        if self._pending_recording is None:
+            return
+        duration = self.pending_duration
+        start = max(0.0, min(start_sec, duration))
+        end = max(0.0, min(end_sec, duration))
+        if end < start:
+            start, end = end, start
+        self._trim_start_sec = start
+        self._trim_end_sec = end
+
+    def get_trimmed_pending_recording(self) -> Optional[np.ndarray]:
+        if self._pending_recording is None:
+            return None
+        duration = self.pending_duration
+        if duration <= 0:
+            return None
+        start_idx = int(self._trim_start_sec * self.audio.samplerate)
+        end_idx = int(self._trim_end_sec * self.audio.samplerate)
+        start_idx = max(0, min(start_idx, len(self._pending_recording)))
+        end_idx = max(0, min(end_idx, len(self._pending_recording)))
+        if end_idx <= start_idx:
+            return None
+        return self._pending_recording[start_idx:end_idx]
+
+    def preview_pending(self, trimmed: bool = True):
+        if trimmed:
+            data = self.get_trimmed_pending_recording()
+        else:
+            data = self._pending_recording
+        if data is None or len(data) == 0:
+            return None
+        return self.audio.play_data(data, samplerate=self.audio.samplerate, volume=1.0)
 
     def assign_file_to_pad(self, row: int, col: int, filepath: str):
         if os.path.exists(filepath):
@@ -172,11 +238,15 @@ class RecorderMode(BaseMode):
             data = self.audio.stop_recording()
             if data is not None and len(data) > 100:
                 self._pending_recording = data
+                self._trim_start_sec = 0.0
+                self._trim_end_sec = self.pending_duration
                 self._state = RecState.ASSIGNING
                 self.assign_to_pad(row, col)
             else:
                 self._state = RecState.IDLE
                 self._pending_recording = None
+                self._trim_start_sec = 0.0
+                self._trim_end_sec = 0.0
 
         elif self._state == RecState.ASSIGNING:
             self.assign_to_pad(row, col)

@@ -648,6 +648,76 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self._rec_status)
 
+        if state == RecState.ASSIGNING and self._recorder.has_pending_recording:
+            trim_group = QGroupBox("Trim Pending Recording")
+            trim_layout = QVBoxLayout(trim_group)
+
+            duration = self._recorder.pending_duration
+            self._trim_info_label = QLabel(
+                f"Original: {duration:.2f}s • Selected: {self._recorder.trim_duration:.2f}s"
+            )
+            self._trim_info_label.setStyleSheet("color: #aaa; font-size: 10px;")
+            trim_layout.addWidget(self._trim_info_label)
+
+            start_row = QHBoxLayout()
+            start_row.addWidget(QLabel("Start"))
+            self._trim_start_slider = QSlider(Qt.Horizontal)
+            self._trim_start_slider.setRange(0, int(duration * 1000))
+            self._trim_start_slider.setValue(int(self._recorder.trim_start_sec * 1000))
+            self._trim_start_slider.valueChanged.connect(self._on_trim_start_changed)
+            self._trim_start_slider.sliderReleased.connect(self._preview_trimmed_pending)
+            self._trim_start_slider.setFixedHeight(28)
+            self._trim_start_slider.setStyleSheet(
+                "QSlider::groove:horizontal {height: 8px; background: #2f2f2f; border-radius: 4px;}"
+                "QSlider::handle:horizontal {background: #44ff44; border: 1px solid #173; width: 20px; margin: -8px 0; border-radius: 10px;}"
+            )
+            start_row.addWidget(self._trim_start_slider)
+            self._trim_start_spin = QDoubleSpinBox()
+            self._trim_start_spin.setDecimals(2)
+            self._trim_start_spin.setRange(0.0, duration)
+            self._trim_start_spin.setSingleStep(0.01)
+            self._trim_start_spin.setValue(self._recorder.trim_start_sec)
+            self._trim_start_spin.valueChanged.connect(self._on_trim_start_spin_changed)
+            self._trim_start_spin.setSuffix(" s")
+            self._trim_start_spin.setMinimumWidth(80)
+            start_row.addWidget(self._trim_start_spin)
+            trim_layout.addLayout(start_row)
+
+            end_row = QHBoxLayout()
+            end_row.addWidget(QLabel("End"))
+            self._trim_end_slider = QSlider(Qt.Horizontal)
+            self._trim_end_slider.setRange(0, int(duration * 1000))
+            self._trim_end_slider.setValue(int(self._recorder.trim_end_sec * 1000))
+            self._trim_end_slider.valueChanged.connect(self._on_trim_end_changed)
+            self._trim_end_slider.sliderReleased.connect(self._preview_trimmed_pending)
+            self._trim_end_slider.setFixedHeight(28)
+            self._trim_end_slider.setStyleSheet(
+                "QSlider::groove:horizontal {height: 8px; background: #2f2f2f; border-radius: 4px;}"
+                "QSlider::handle:horizontal {background: #44ff44; border: 1px solid #173; width: 20px; margin: -8px 0; border-radius: 10px;}"
+            )
+            end_row.addWidget(self._trim_end_slider)
+            self._trim_end_spin = QDoubleSpinBox()
+            self._trim_end_spin.setDecimals(2)
+            self._trim_end_spin.setRange(0.0, duration)
+            self._trim_end_spin.setSingleStep(0.01)
+            self._trim_end_spin.setValue(self._recorder.trim_end_sec)
+            self._trim_end_spin.valueChanged.connect(self._on_trim_end_spin_changed)
+            self._trim_end_spin.setSuffix(" s")
+            self._trim_end_spin.setMinimumWidth(80)
+            end_row.addWidget(self._trim_end_spin)
+            trim_layout.addLayout(end_row)
+
+            preview_row = QHBoxLayout()
+            preview_trim_btn = QPushButton("▶ Preview Selected")
+            preview_trim_btn.clicked.connect(self._preview_trimmed_pending)
+            preview_row.addWidget(preview_trim_btn)
+            preview_full_btn = QPushButton("▶ Preview Full")
+            preview_full_btn.clicked.connect(self._preview_full_pending)
+            preview_row.addWidget(preview_full_btn)
+            trim_layout.addLayout(preview_row)
+
+            layout.addWidget(trim_group)
+
         # Contextual instructions
         if state == RecState.IDLE:
             info = QLabel(
@@ -936,6 +1006,79 @@ class MainWindow(QMainWindow):
         self._recorder.discard_pending()
         self._rebuild_mode_controls()
         self._statusbar.showMessage("Recording discarded.")
+
+    def _on_trim_start_changed(self, value: int):
+        if not self._recorder.has_pending_recording:
+            return
+        start_sec = value / 1000.0
+        self._recorder.set_trim(start_sec, self._recorder.trim_end_sec)
+        self._sync_trim_controls()
+
+    def _on_trim_end_changed(self, value: int):
+        if not self._recorder.has_pending_recording:
+            return
+        end_sec = value / 1000.0
+        self._recorder.set_trim(self._recorder.trim_start_sec, end_sec)
+        self._sync_trim_controls()
+
+    def _on_trim_start_spin_changed(self, value: float):
+        if not self._recorder.has_pending_recording:
+            return
+        self._recorder.set_trim(value, self._recorder.trim_end_sec)
+        self._sync_trim_controls()
+
+    def _on_trim_end_spin_changed(self, value: float):
+        if not self._recorder.has_pending_recording:
+            return
+        self._recorder.set_trim(self._recorder.trim_start_sec, value)
+        self._sync_trim_controls()
+
+    def _sync_trim_controls(self):
+        if not self._recorder.has_pending_recording:
+            return
+        blockers = []
+        controls = [
+            getattr(self, "_trim_start_slider", None),
+            getattr(self, "_trim_end_slider", None),
+            getattr(self, "_trim_start_spin", None),
+            getattr(self, "_trim_end_spin", None),
+        ]
+        for ctrl in controls:
+            if ctrl is not None:
+                blockers.append(ctrl.blockSignals(True))
+
+        if getattr(self, "_trim_start_slider", None) is not None:
+            self._trim_start_slider.setValue(int(self._recorder.trim_start_sec * 1000))
+        if getattr(self, "_trim_end_slider", None) is not None:
+            self._trim_end_slider.setValue(int(self._recorder.trim_end_sec * 1000))
+        if getattr(self, "_trim_start_spin", None) is not None:
+            self._trim_start_spin.setValue(self._recorder.trim_start_sec)
+        if getattr(self, "_trim_end_spin", None) is not None:
+            self._trim_end_spin.setValue(self._recorder.trim_end_sec)
+        if getattr(self, "_trim_info_label", None) is not None:
+            self._trim_info_label.setText(
+                f"Original: {self._recorder.pending_duration:.2f}s • Selected: {self._recorder.trim_duration:.2f}s"
+            )
+
+        idx = 0
+        for ctrl in controls:
+            if ctrl is not None:
+                ctrl.blockSignals(blockers[idx])
+                idx += 1
+
+    def _preview_trimmed_pending(self):
+        if not self._recorder.has_pending_recording:
+            return
+        self.audio.stop_all()
+        played = self._recorder.preview_pending(trimmed=True)
+        if played is None:
+            self._statusbar.showMessage("Selected trim is too short to preview.")
+
+    def _preview_full_pending(self):
+        if not self._recorder.has_pending_recording:
+            return
+        self.audio.stop_all()
+        self._recorder.preview_pending(trimmed=False)
 
     def _import_to_recorder_pad(self):
         """Import an audio file directly to the currently selected pad."""
