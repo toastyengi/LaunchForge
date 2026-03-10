@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
         self._grid = LaunchpadGrid()
         self._grid.grid_pressed.connect(self._on_virtual_grid_press)
         self._grid.grid_released.connect(self._on_virtual_grid_release)
+        self._grid.grid_file_dropped.connect(self._on_grid_file_dropped)
         self._grid.control_pressed.connect(self._on_virtual_control_press)
         self._grid.control_released.connect(self._on_virtual_control_release)
         left_panel.addWidget(self._grid, stretch=1)
@@ -1025,6 +1026,42 @@ class MainWindow(QMainWindow):
         self._bank_label.setText(
             f"Bank {self._soundboard.current_bank + 1}/{self._soundboard.num_banks}"
         )
+
+    # --- Drag and Drop ---
+
+    def _on_grid_file_dropped(self, row: int, col: int, filepath: str):
+        """Handle a sound file dropped onto a grid pad."""
+        mode = self.mode_manager.current_mode
+
+        if isinstance(mode, SoundboardMode):
+            color = "green"
+            volume = 0.8
+            # Use current UI settings if a pad was already selected
+            if hasattr(self, "_sb_color_combo"):
+                color = self._sb_color_combo.currentText() or "green"
+            if hasattr(self, "_sb_vol_slider"):
+                volume = self._sb_vol_slider.value() / 100.0
+            config = PadConfig(
+                filepath=filepath, color=color, volume=volume,
+                label=os.path.basename(filepath)[:6],
+            )
+            self._soundboard.set_pad(row, col, config)
+            # Update selection to the dropped pad
+            self._sb_selected_pad = (row, col)
+            self._sb_selected_label.setText(
+                f"Pad [{row},{col}]: {os.path.basename(filepath)}"
+            )
+            self._statusbar.showMessage(
+                f"Dropped {os.path.basename(filepath)} onto pad [{row},{col}]"
+            )
+            self._update_grid_display()
+
+        elif isinstance(mode, StepSequencerMode):
+            self._sequencer.set_sample(row, filepath)
+            self._rebuild_mode_controls()
+            self._statusbar.showMessage(
+                f"Dropped {os.path.basename(filepath)} onto sequencer row {row + 1}"
+            )
 
     # --- Recorder Controls ---
 
