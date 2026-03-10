@@ -4,6 +4,8 @@ Supports WAV, OGG, and MP3 (via pydub/ffmpeg).
 """
 
 import os
+import subprocess
+import shutil
 import threading
 import time
 import json
@@ -70,6 +72,248 @@ class AudioDevice:
         if SD_AVAILABLE:
             return sd.default.device
         return [None, None]
+
+
+class VirtualMicSink:
+    """Manages a virtual microphone sink via PipeWire/PulseAudio.
+
+    Creates a null sink for LaunchForge audio output, optionally mixes in a
+    real microphone, and exposes a virtual source (mic) that applications
+    like Discord or games can select as their input device.
+
+    Routing diagram:
+        LaunchForge output -> SoundboardSink (null sink)
+            -> loopback -> DiscordMix (null sink)
+        Real mic (optional) -> loopback -> DiscordMix
+        DiscordMix.monitor -> remap-source -> DiscordMic (virtual mic)
+        SoundboardSink.monitor -> loopback -> local speakers (optional)
+    """
+
+    SINK_NAME = "LaunchForgeSink"
+    MIX_SINK = "LaunchForgeMix"
+    VMIC_NAME = "LaunchForgeMic"
+
+    def __init__(self):
+        self._module_ids: List[int] = []
+        self._active = False
+        self._mic_source: Optional[str] = None
+        self._local_sink: Optional[str] = None
+        self._local_monitor_enabled = False
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if pactl is available on this system."""
+        return shutil.which("pactl") is not None
+
+    @staticmethod
+    def _run_pactl(*args) -> Optional[str]:
+        """Run a pactl command and return stdout, or None on failure."""
+        try:
+            result = subprocess.run(
+                ["pactl"] + list(args),
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            print(f"[VirtualMic] pactl error: {result.stderr.strip()}")
+            return None
+        except FileNotFoundError:
+            print("[VirtualMic] pactl not found")
+            return None
+        except subprocess.TimeoutExpired:
+            print("[VirtualMic] pactl timed out")
+            return None
+
+    @staticmethod
+    def _has_sink(name: str) -> bool:
+        out = VirtualMicSink._run_pactl("list", "short", "sinks")
+        if out is None:
+            return False
+        for line in out.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2 and fields[1] == name:
+                return True
+        return False
+
+    @staticmethod
+    def _has_source(name: str) -> bool:
+        out = VirtualMicSink._run_pactl("list", "short", "sources")
+        if out is None:
+            return False
+        for line in out.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2 and fields[1] == name:
+                return True
+        return False
+
+    @staticmethod
+    def list_pulse_sources() -> List[str]:
+        """List available PulseAudio/PipeWire source names (real mics)."""
+        out = VirtualMicSink._run_pactl("list", "short", "sources")
+        if out is None:
+            return []
+        sources = []
+        for line in out.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2:
+                name = fields[1]
+                # Skip monitors — they are not real microphones
+                if ".monitor" not in name:
+                    sources.append(name)
+        return sources
+
+    @staticmethod
+    def list_pulse_sinks() -> List[str]:
+        """List available PulseAudio/PipeWire sink names (speakers/headphones)."""
+        out = VirtualMicSink._run_pactl("list", "short", "sinks")
+        if out is None:
+            return []
+        sinks = []
+        for line in out.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2:
+                sinks.append(fields[1])
+        return sinks
+
+    def _load_module(self, module: str, **kwargs) -> Optional[int]:
+        """Load a PulseAudio module and track its ID for cleanup."""
+        args = [f"{k}={v}" for k, v in kwargs.items()]
+        out = self._run_pactl("load-module", module, *args)
+        if out is not None:
+            try:
+                mod_id = int(out)
+                self._module_ids.append(mod_id)
+                return mod_id
+            except ValueError:
+                pass
+        return None
+
+    def setup(self, mic_source: Optional[str] = None,
+              local_sink: Optional[str] = None,
+              local_monitor: bool = False) -> bool:
+        """Set up the virtual microphone routing.
+
+        Args:
+            mic_source: PulseAudio source name of a real microphone to mix in.
+                        If None, only LaunchForge audio is sent to the virtual mic.
+            local_sink: PulseAudio sink name for local monitoring (hear your own
+                        soundboard sounds through speakers). If None, no local
+                        monitoring.
+            local_monitor: Whether to enable local monitoring of LaunchForge
+                           audio through the local_sink.
+
+        Returns:
+            True if setup succeeded.
+        """
+        if not self.is_available():
+            print("[VirtualMic] pactl not available — is PipeWire/PulseAudio running?")
+            return False
+
+        # Tear down any existing setup first
+        if self._active:
+            self.teardown()
+
+        self._mic_source = mic_source
+        self._local_sink = local_sink
+        self._local_monitor_enabled = local_monitor
+
+        # 1. Create the LaunchForge null sink (soundboard audio goes here)
+        if not self._has_sink(self.SINK_NAME):
+            if self._load_module(
+                "module-null-sink",
+                sink_name=self.SINK_NAME,
+                sink_properties=f"device.description={self.SINK_NAME}",
+            ) is None:
+                print("[VirtualMic] Failed to create LaunchForge sink")
+                self.teardown()
+                return False
+
+        # 2. Create the mix sink (combines soundboard + optional mic)
+        if not self._has_sink(self.MIX_SINK):
+            if self._load_module(
+                "module-null-sink",
+                sink_name=self.MIX_SINK,
+                sink_properties=f"device.description={self.MIX_SINK}",
+            ) is None:
+                print("[VirtualMic] Failed to create mix sink")
+                self.teardown()
+                return False
+
+        # 3. Loopback: LaunchForge sink monitor -> mix sink
+        if self._load_module(
+            "module-loopback",
+            source=f"{self.SINK_NAME}.monitor",
+            sink=self.MIX_SINK,
+            latency_msec="1",
+        ) is None:
+            print("[VirtualMic] Failed to create soundboard->mix loopback")
+            self.teardown()
+            return False
+
+        # 4. Loopback: real microphone -> mix sink (optional)
+        if mic_source:
+            if self._load_module(
+                "module-loopback",
+                source=mic_source,
+                sink=self.MIX_SINK,
+                latency_msec="1",
+            ) is None:
+                print(f"[VirtualMic] Warning: failed to loopback mic '{mic_source}'")
+                # Non-fatal — virtual mic still works without real mic mixed in
+
+        # 5. Create the virtual microphone source from the mix monitor
+        if not self._has_source(self.VMIC_NAME):
+            if self._load_module(
+                "module-remap-source",
+                **{
+                    "master": f"{self.MIX_SINK}.monitor",
+                    "source_name": self.VMIC_NAME,
+                    "source_properties": f"device.description={self.VMIC_NAME}",
+                },
+            ) is None:
+                print("[VirtualMic] Failed to create virtual mic source")
+                self.teardown()
+                return False
+
+        # 6. Optional: loopback soundboard to local speakers for monitoring
+        if local_monitor and local_sink:
+            if self._load_module(
+                "module-loopback",
+                source=f"{self.SINK_NAME}.monitor",
+                sink=local_sink,
+                latency_msec="1",
+            ) is None:
+                print(f"[VirtualMic] Warning: failed local monitor to '{local_sink}'")
+
+        self._active = True
+        print(f"[VirtualMic] Virtual mic ready — select '{self.VMIC_NAME}' "
+              f"as input in Discord/games")
+        return True
+
+    def teardown(self):
+        """Remove all PulseAudio modules created by this instance."""
+        for mod_id in reversed(self._module_ids):
+            self._run_pactl("unload-module", str(mod_id))
+        self._module_ids.clear()
+        self._active = False
+        self._mic_source = None
+        self._local_sink = None
+        self._local_monitor_enabled = False
+        print("[VirtualMic] Virtual mic teardown complete")
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def sink_name(self) -> str:
+        """The PulseAudio sink name that LaunchForge should output to."""
+        return self.SINK_NAME
+
+    @property
+    def vmic_name(self) -> str:
+        """The virtual mic source name to select in Discord/games."""
+        return self.VMIC_NAME
 
 
 class SoundLoader:

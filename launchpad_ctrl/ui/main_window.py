@@ -20,7 +20,13 @@ from PyQt5.QtGui import QFont, QIcon
 from launchpad_ctrl.ui.grid_widget import LaunchpadGrid
 from launchpad_ctrl.ui.theme import DARK_THEME
 from launchpad_ctrl.core import LaunchpadMIDI, LPColor
-from launchpad_ctrl.core.audio import AudioEngine, AudioDevice
+from launchpad_ctrl.core.audio import AudioEngine, AudioDevice, VirtualMicSink
+
+try:
+    import sounddevice as sd
+    SD_AVAILABLE = True
+except ImportError:
+    SD_AVAILABLE = False
 from launchpad_ctrl.modes import ModeManager
 from launchpad_ctrl.modes.sequencer import StepSequencerMode
 from launchpad_ctrl.modes.soundboard import SoundboardMode, PadConfig
@@ -61,6 +67,7 @@ class MainWindow(QMainWindow):
         # Core systems
         self.midi = LaunchpadMIDI()
         self.audio = AudioEngine()
+        self.virtual_mic = VirtualMicSink()
         self.mode_manager = ModeManager(self.midi, self.audio)
 
         # Register modes
@@ -248,6 +255,63 @@ class MainWindow(QMainWindow):
         layout.addWidget(refresh_btn)
 
         self._refresh_audio_devices()
+
+        # --- Virtual Microphone Sink (Linux / PipeWire/PulseAudio) ---
+        if VirtualMicSink.is_available():
+            vmic_group = QGroupBox("Virtual Microphone (Discord/Games)")
+            vmic_layout = QVBoxLayout(vmic_group)
+
+            vmic_desc = QLabel(
+                "Route LaunchForge audio to a virtual mic that Discord, "
+                "games, and other apps can use as an input device."
+            )
+            vmic_desc.setWordWrap(True)
+            vmic_layout.addWidget(vmic_desc)
+
+            # Mix-in real microphone selection
+            vmic_layout.addWidget(QLabel("Mix-in real microphone:"))
+            self._vmic_mic_combo = QComboBox()
+            self._vmic_mic_combo.addItem("(None — soundboard only)", "")
+            vmic_layout.addWidget(self._vmic_mic_combo)
+
+            # Local monitor sink selection
+            self._vmic_monitor_cb = QPushButton("Local Monitoring")
+            self._vmic_monitor_cb.setCheckable(True)
+            self._vmic_monitor_cb.setChecked(False)
+            self._vmic_monitor_cb.setToolTip(
+                "Hear LaunchForge audio through your speakers while it "
+                "is also sent to the virtual mic."
+            )
+            vmic_layout.addWidget(self._vmic_monitor_cb)
+
+            vmic_layout.addWidget(QLabel("Local monitor output:"))
+            self._vmic_local_combo = QComboBox()
+            vmic_layout.addWidget(self._vmic_local_combo)
+
+            # Enable / Disable buttons
+            vmic_btn_layout = QHBoxLayout()
+            self._vmic_enable_btn = QPushButton("Enable Virtual Mic")
+            self._vmic_enable_btn.clicked.connect(self._on_vmic_enable)
+            vmic_btn_layout.addWidget(self._vmic_enable_btn)
+
+            self._vmic_disable_btn = QPushButton("Disable")
+            self._vmic_disable_btn.setEnabled(False)
+            self._vmic_disable_btn.clicked.connect(self._on_vmic_disable)
+            vmic_btn_layout.addWidget(self._vmic_disable_btn)
+            vmic_layout.addLayout(vmic_btn_layout)
+
+            # Refresh PulseAudio sources/sinks
+            vmic_refresh_btn = QPushButton("Refresh PulseAudio Devices")
+            vmic_refresh_btn.clicked.connect(self._refresh_vmic_devices)
+            vmic_layout.addWidget(vmic_refresh_btn)
+
+            # Status label
+            self._vmic_status = QLabel("Status: Inactive")
+            vmic_layout.addWidget(self._vmic_status)
+
+            layout.addWidget(vmic_group)
+
+            self._refresh_vmic_devices()
 
         layout.addStretch()
         return widget
@@ -925,6 +989,127 @@ class MainWindow(QMainWindow):
         self.audio.master_volume = value / 100.0
         self._vol_label.setText(f"{value}%")
 
+    # --- Virtual Microphone ---
+
+    def _refresh_vmic_devices(self):
+        """Refresh the PulseAudio source/sink lists for virtual mic setup."""
+        if not hasattr(self, "_vmic_mic_combo"):
+            return
+
+        self._vmic_mic_combo.blockSignals(True)
+        self._vmic_local_combo.blockSignals(True)
+
+        # Preserve current selections
+        cur_mic = self._vmic_mic_combo.currentData()
+        cur_local = self._vmic_local_combo.currentData()
+
+        self._vmic_mic_combo.clear()
+        self._vmic_mic_combo.addItem("(None — soundboard only)", "")
+
+        for src in VirtualMicSink.list_pulse_sources():
+            # Don't show our own virtual sources
+            if src not in (VirtualMicSink.VMIC_NAME,):
+                self._vmic_mic_combo.addItem(src, src)
+
+        self._vmic_local_combo.clear()
+        for sink in VirtualMicSink.list_pulse_sinks():
+            # Don't show our own virtual sinks
+            if sink not in (VirtualMicSink.SINK_NAME, VirtualMicSink.MIX_SINK):
+                self._vmic_local_combo.addItem(sink, sink)
+
+        # Restore selections
+        if cur_mic:
+            idx = self._vmic_mic_combo.findData(cur_mic)
+            if idx >= 0:
+                self._vmic_mic_combo.setCurrentIndex(idx)
+        if cur_local:
+            idx = self._vmic_local_combo.findData(cur_local)
+            if idx >= 0:
+                self._vmic_local_combo.setCurrentIndex(idx)
+
+        self._vmic_mic_combo.blockSignals(False)
+        self._vmic_local_combo.blockSignals(False)
+
+    def _on_vmic_enable(self):
+        """Enable the virtual microphone sink routing."""
+        mic_source = self._vmic_mic_combo.currentData() or None
+        local_sink = self._vmic_local_combo.currentData() or None
+        local_monitor = self._vmic_monitor_cb.isChecked()
+
+        ok = self.virtual_mic.setup(
+            mic_source=mic_source,
+            local_sink=local_sink,
+            local_monitor=local_monitor,
+        )
+
+        if ok:
+            self._vmic_status.setText(
+                f"Status: Active — select '{VirtualMicSink.VMIC_NAME}' "
+                f"as input in Discord/games"
+            )
+            self._vmic_status.setStyleSheet("color: #44ff44;")
+            self._vmic_enable_btn.setEnabled(False)
+            self._vmic_disable_btn.setEnabled(True)
+
+            # Switch LaunchForge output to the virtual sink so audio
+            # flows through the routing chain
+            self._set_output_to_virtual_sink()
+
+            self._statusbar.showMessage(
+                f"Virtual mic enabled — use '{VirtualMicSink.VMIC_NAME}' in Discord"
+            )
+        else:
+            self._vmic_status.setText("Status: Setup failed (check terminal)")
+            self._vmic_status.setStyleSheet("color: #ff4444;")
+            QMessageBox.warning(
+                self, "Virtual Mic",
+                "Failed to set up virtual microphone.\n"
+                "Make sure PipeWire or PulseAudio is running.\n"
+                "Check the terminal for details.",
+            )
+
+    def _on_vmic_disable(self):
+        """Disable the virtual microphone and restore normal output."""
+        self.virtual_mic.teardown()
+        self._vmic_status.setText("Status: Inactive")
+        self._vmic_status.setStyleSheet("")
+        self._vmic_enable_btn.setEnabled(True)
+        self._vmic_disable_btn.setEnabled(False)
+
+        # Refresh the sounddevice device list and restore normal output
+        self._refresh_audio_devices()
+        self._statusbar.showMessage("Virtual mic disabled — normal output restored")
+
+    def _set_output_to_virtual_sink(self):
+        """Switch the LaunchForge audio output to the virtual sink."""
+        if not SD_AVAILABLE:
+            return
+        # Find the virtual sink in the sounddevice device list
+        try:
+            devices = sd.query_devices()
+            for i, d in enumerate(devices):
+                if d["max_output_channels"] > 0 and VirtualMicSink.SINK_NAME in d["name"]:
+                    AudioDevice.set_output_device(i)
+                    self.audio.restart()
+
+                    # Update the output combo to reflect the change
+                    self._output_combo.blockSignals(True)
+                    self._refresh_audio_devices()
+                    for j in range(self._output_combo.count()):
+                        if self._output_combo.itemData(j) == i:
+                            self._output_combo.setCurrentIndex(j)
+                            break
+                    self._output_combo.blockSignals(False)
+
+                    print(f"[VirtualMic] Output switched to {d['name']}")
+                    return
+        except Exception as e:
+            print(f"[VirtualMic] Could not auto-switch output device: {e}")
+
+        print("[VirtualMic] Note: could not find virtual sink in sounddevice. "
+              "You may need to manually select it from the Output Device dropdown "
+              "after clicking 'Refresh Devices'.")
+
     # --- MIDI Connection ---
 
     def _refresh_midi_ports(self):
@@ -1363,5 +1548,8 @@ class MainWindow(QMainWindow):
         self._sequencer.stop_playback()
         self.midi.clear_all()
         self.midi.disconnect()
+        # Tear down virtual mic routing before stopping audio
+        if self.virtual_mic.active:
+            self.virtual_mic.teardown()
         self.audio.stop()
         event.accept()
