@@ -30,6 +30,109 @@ except ImportError:
     PYDUB_AVAILABLE = False
 
 
+class VirtualAudioDevice:
+    """Manages a virtual audio sink via PipeWire/PulseAudio for feeding audio to other apps.
+
+    Creates a null-sink module whose monitor source appears as a microphone
+    input in Discord, games, and other applications. Works on Arch Linux
+    with either PipeWire (pipewire-pulse) or PulseAudio.
+    """
+
+    SINK_NAME = "LaunchForge_Virtual_Mic"
+    SINK_DESCRIPTION = "LaunchForge Virtual Mic"
+
+    def __init__(self):
+        self._module_id: Optional[int] = None
+        self._sink_device_index: Optional[int] = None
+        self._enabled = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def sink_device_index(self) -> Optional[int]:
+        """sounddevice index of the virtual sink (output side)."""
+        return self._sink_device_index
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if pactl is available on the system."""
+        import shutil
+        return shutil.which("pactl") is not None
+
+    def create(self) -> bool:
+        """Load the null-sink module and return True on success."""
+        if self._enabled:
+            return True
+        if not self.is_available():
+            print("[VirtualAudio] pactl not found – install pipewire-pulse or pulseaudio")
+            return False
+
+        import subprocess
+        try:
+            result = subprocess.run(
+                [
+                    "pactl", "load-module", "module-null-sink",
+                    f"sink_name={self.SINK_NAME}",
+                    f"sink_properties=device.description={self.SINK_DESCRIPTION}",
+                    "rate=44100", "channels=2",
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                print(f"[VirtualAudio] pactl error: {result.stderr.strip()}")
+                return False
+
+            self._module_id = int(result.stdout.strip())
+            self._enabled = True
+            self._resolve_device_index()
+            print(f"[VirtualAudio] Created sink (module {self._module_id}, "
+                  f"device index {self._sink_device_index})")
+            return True
+        except Exception as e:
+            print(f"[VirtualAudio] Failed to create sink: {e}")
+            return False
+
+    def destroy(self) -> bool:
+        """Unload the null-sink module."""
+        if not self._enabled or self._module_id is None:
+            self._enabled = False
+            return True
+
+        import subprocess
+        try:
+            subprocess.run(
+                ["pactl", "unload-module", str(self._module_id)],
+                capture_output=True, text=True, timeout=5,
+            )
+            print(f"[VirtualAudio] Removed sink (module {self._module_id})")
+        except Exception as e:
+            print(f"[VirtualAudio] Failed to remove sink: {e}")
+
+        self._module_id = None
+        self._sink_device_index = None
+        self._enabled = False
+        return True
+
+    def _resolve_device_index(self):
+        """Find the sounddevice index matching our virtual sink."""
+        if not SD_AVAILABLE:
+            return
+        # Give PipeWire/PA a moment to register the new device
+        import time
+        time.sleep(0.3)
+        # Re-query sounddevice so it sees the new sink
+        sd._terminate()
+        sd._initialize()
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if self.SINK_NAME in d["name"] and d["max_output_channels"] > 0:
+                self._sink_device_index = i
+                return
+        print("[VirtualAudio] Warning: sink created but not found in sounddevice list")
+
+
 class AudioDevice:
     """Manages audio device selection and enumeration."""
 
@@ -201,6 +304,10 @@ class AudioEngine:
         self._master_volume = 0.8
         self._lock = threading.Lock()
         self._on_record_complete: Optional[Callable] = None
+        # Virtual audio device support
+        self.virtual_device = VirtualAudioDevice()
+        self._virtual_stream = None
+        self._last_mix = None
 
     @property
     def master_volume(self):
@@ -235,11 +342,15 @@ class AudioEngine:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        self._stop_virtual_stream()
         self.start()
+        if self.virtual_device.enabled:
+            self._start_virtual_stream()
 
     def stop(self):
         """Stop the audio engine."""
         self.stop_all()
+        self._stop_virtual_stream()
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -249,6 +360,53 @@ class AudioEngine:
             self._record_stream.close()
             self._record_stream = None
         print("[Audio] Engine stopped")
+
+    # --- Virtual Audio Device ---
+
+    def enable_virtual_device(self) -> bool:
+        """Create the virtual sink and start mirroring audio to it."""
+        if not self.virtual_device.create():
+            return False
+        self._start_virtual_stream()
+        return True
+
+    def disable_virtual_device(self):
+        """Stop mirroring and destroy the virtual sink."""
+        self._stop_virtual_stream()
+        self.virtual_device.destroy()
+
+    def _start_virtual_stream(self):
+        """Open a secondary output stream targeting the virtual sink."""
+        if not SD_AVAILABLE or self._virtual_stream is not None:
+            return
+        dev_idx = self.virtual_device.sink_device_index
+        if dev_idx is None:
+            print("[VirtualAudio] No device index – cannot open stream")
+            return
+        try:
+            self._virtual_stream = sd.OutputStream(
+                samplerate=self.samplerate,
+                blocksize=self.blocksize,
+                channels=2,
+                dtype="float32",
+                device=dev_idx,
+                callback=self._virtual_audio_callback,
+            )
+            self._virtual_stream.start()
+            print("[VirtualAudio] Mirror stream started")
+        except Exception as e:
+            print(f"[VirtualAudio] Failed to start mirror stream: {e}")
+            self._virtual_stream = None
+
+    def _stop_virtual_stream(self):
+        """Close the virtual sink output stream."""
+        if self._virtual_stream:
+            try:
+                self._virtual_stream.stop()
+                self._virtual_stream.close()
+            except Exception:
+                pass
+            self._virtual_stream = None
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Audio stream callback - mixes all active playback instances."""
@@ -268,6 +426,16 @@ class AudioEngine:
         # Clip to prevent distortion
         np.clip(output, -1.0, 1.0, out=output)
         outdata[:] = output
+        # Share the mixed buffer for the virtual sink mirror stream
+        self._last_mix = output.copy()
+
+    def _virtual_audio_callback(self, outdata, frames, time_info, status):
+        """Mirror the same mix to the virtual sink so other apps can capture it."""
+        buf = self._last_mix
+        if buf is not None and len(buf) >= frames:
+            outdata[:] = buf[:frames]
+        else:
+            outdata[:] = 0
 
     def play_sound(self, filepath: str, volume: float = 1.0, loop: bool = False) -> Optional[int]:
         """Play a sound file. Returns playback instance ID."""

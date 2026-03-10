@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QSlider, QSpinBox, QDoubleSpinBox,
     QComboBox, QFileDialog, QGroupBox, QStatusBar, QMenuBar,
     QAction, QMessageBox, QSplitter, QFrame, QTabWidget,
-    QScrollArea, QLineEdit, QSizePolicy, QApplication
+    QScrollArea, QLineEdit, QSizePolicy, QApplication, QCheckBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont, QIcon
 from launchpad_ctrl.ui.grid_widget import LaunchpadGrid
 from launchpad_ctrl.ui.theme import DARK_THEME
 from launchpad_ctrl.core import LaunchpadMIDI, LPColor
-from launchpad_ctrl.core.audio import AudioEngine, AudioDevice
+from launchpad_ctrl.core.audio import AudioEngine, AudioDevice, VirtualAudioDevice
 from launchpad_ctrl.modes import ModeManager
 from launchpad_ctrl.modes.sequencer import StepSequencerMode
 from launchpad_ctrl.modes.soundboard import SoundboardMode, PadConfig
@@ -246,6 +246,39 @@ class MainWindow(QMainWindow):
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._refresh_audio_devices)
         layout.addWidget(refresh_btn)
+
+        # Virtual Audio Device (for feeding audio to Discord, games, etc.)
+        virt_group = QGroupBox("Virtual Audio Device")
+        virt_layout = QVBoxLayout(virt_group)
+
+        self._virtual_audio_cb = QCheckBox("Enable Virtual Microphone")
+        self._virtual_audio_cb.setToolTip(
+            "Creates a virtual microphone that other apps (Discord, games, etc.) "
+            "can use as an input device. All sounds played by LaunchForge will be "
+            "fed into this virtual mic.\n\n"
+            "Requires PipeWire (pipewire-pulse) or PulseAudio on Arch Linux."
+        )
+        self._virtual_audio_cb.stateChanged.connect(self._on_virtual_audio_toggled)
+        virt_layout.addWidget(self._virtual_audio_cb)
+
+        self._virtual_audio_status = QLabel("")
+        self._virtual_audio_status.setWordWrap(True)
+        virt_layout.addWidget(self._virtual_audio_status)
+
+        if not VirtualAudioDevice.is_available():
+            self._virtual_audio_cb.setEnabled(False)
+            self._virtual_audio_status.setText(
+                "pactl not found. Install pipewire-pulse or pulseaudio:\n"
+                "  sudo pacman -S pipewire-pulse"
+            )
+            self._virtual_audio_status.setStyleSheet("color: #ff6666;")
+        else:
+            self._virtual_audio_status.setText(
+                "Disabled. Enable to create a virtual mic for other apps."
+            )
+            self._virtual_audio_status.setStyleSheet("color: #aaaaaa;")
+
+        layout.addWidget(virt_group)
 
         self._refresh_audio_devices()
 
@@ -925,6 +958,36 @@ class MainWindow(QMainWindow):
         self.audio.master_volume = value / 100.0
         self._vol_label.setText(f"{value}%")
 
+    def _on_virtual_audio_toggled(self, state):
+        if state == Qt.Checked:
+            ok = self.audio.enable_virtual_device()
+            if ok:
+                self._virtual_audio_status.setText(
+                    "Active. Select \"LaunchForge Virtual Mic\" as your\n"
+                    "microphone input in Discord / other apps."
+                )
+                self._virtual_audio_status.setStyleSheet("color: #44ff44;")
+                self._statusbar.showMessage("Virtual mic enabled")
+                # Refresh device list so the new sink appears
+                self._refresh_audio_devices()
+            else:
+                self._virtual_audio_cb.blockSignals(True)
+                self._virtual_audio_cb.setChecked(False)
+                self._virtual_audio_cb.blockSignals(False)
+                self._virtual_audio_status.setText(
+                    "Failed to create virtual sink. Check terminal for details."
+                )
+                self._virtual_audio_status.setStyleSheet("color: #ff6666;")
+        else:
+            self.audio.disable_virtual_device()
+            self._virtual_audio_status.setText(
+                "Disabled. Enable to create a virtual mic for other apps."
+            )
+            self._virtual_audio_status.setStyleSheet("color: #aaaaaa;")
+            self._statusbar.showMessage("Virtual mic disabled")
+            # Refresh device list to remove the now-gone sink
+            self._refresh_audio_devices()
+
     # --- MIDI Connection ---
 
     def _refresh_midi_ports(self):
@@ -1363,5 +1426,7 @@ class MainWindow(QMainWindow):
         self._sequencer.stop_playback()
         self.midi.clear_all()
         self.midi.disconnect()
+        # Clean up virtual audio sink before stopping the engine
+        self.audio.disable_virtual_device()
         self.audio.stop()
         event.accept()
