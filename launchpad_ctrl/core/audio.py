@@ -118,18 +118,22 @@ def _parse_pactl_list(kind: str) -> List[Dict]:
     return devices
 
 
-def _pactl_set_default(kind: str, pa_name: str):
-    """Set the PulseAudio/PipeWire default sink or source.
+def _pulse_env_set(pa_name: Optional[str], direction: str):
+    """Set or clear the ``PULSE_SINK`` / ``PULSE_SOURCE`` env-var.
 
-    *kind* must be ``"sink"`` or ``"source"``.
+    When PortAudio opens a stream through PulseAudio/PipeWire it honours
+    these variables to route *that specific stream* to the named device
+    **without** changing the system-wide default.  This is the same
+    mechanism ``mpv --audio-device=pulse/<name>`` uses internally.
+
+    *direction* must be ``"output"`` (sets ``PULSE_SINK``) or
+    ``"input"`` (sets ``PULSE_SOURCE``).
     """
-    try:
-        subprocess.run(
-            ["pactl", f"set-default-{kind}", pa_name],
-            capture_output=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    env_key = "PULSE_SINK" if direction == "output" else "PULSE_SOURCE"
+    if pa_name:
+        os.environ[env_key] = pa_name
+    else:
+        os.environ.pop(env_key, None)
 
 
 def _sd_device_for_pa(pa_name: str, pa_description: str,
@@ -282,10 +286,9 @@ class AudioDevice:
             if isinstance(device_id, int):
                 sd.default.device[0] = device_id
             else:
-                # PA-only device – set PulseAudio default, sd uses system default
                 sd.default.device[0] = None
-        if pa_name:
-            _pactl_set_default("source", pa_name)
+        # Route via PULSE_SOURCE env-var (per-stream, not system-wide)
+        _pulse_env_set(pa_name, "input")
 
     @classmethod
     def set_output_device(cls, device_id, pa_name: Optional[str] = None):
@@ -300,8 +303,8 @@ class AudioDevice:
                 sd.default.device[1] = device_id
             else:
                 sd.default.device[1] = None
-        if pa_name:
-            _pactl_set_default("sink", pa_name)
+        # Route via PULSE_SINK env-var (per-stream, not system-wide)
+        _pulse_env_set(pa_name, "output")
 
     @staticmethod
     def get_default_devices():
@@ -465,11 +468,8 @@ class AudioEngine:
             print("[Audio] sounddevice not available")
             return
 
-        # If a PA output device was selected, ensure it is the PA default
-        # so that sounddevice (using the system default) will route to it.
-        pa_out = AudioDevice._selected_output_pa
-        if pa_out:
-            _pactl_set_default("sink", pa_out)
+        # Ensure PULSE_SINK is set so PortAudio routes to the right device.
+        _pulse_env_set(AudioDevice._selected_output_pa, "output")
 
         try:
             kwargs = {
@@ -479,7 +479,8 @@ class AudioEngine:
                 "dtype": "float32",
                 "callback": self._audio_callback,
             }
-            # Use explicit device index if available, otherwise system default
+            # Use explicit sd index when we have one; otherwise leave it to
+            # the system default (PULSE_SINK handles routing).
             dev = sd.default.device[1]
             if isinstance(dev, int):
                 kwargs["device"] = dev
@@ -610,10 +611,8 @@ class AudioEngine:
             print("[Audio] sounddevice not available for recording")
             return
 
-        # If a PA input device was selected, ensure it is the PA default
-        pa_in = AudioDevice._selected_input_pa
-        if pa_in:
-            _pactl_set_default("source", pa_in)
+        # Ensure PULSE_SOURCE is set so PortAudio routes to the right device.
+        _pulse_env_set(AudioDevice._selected_input_pa, "input")
 
         self._record_buffer = []
         self._recording = True
