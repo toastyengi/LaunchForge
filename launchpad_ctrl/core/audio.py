@@ -1,13 +1,19 @@
 """
 Audio engine for playback, recording, and device management.
 Supports WAV, OGG, and MP3 (via pydub/ffmpeg).
+
+Device enumeration uses PulseAudio/PipeWire (via pactl) when available so that
+virtual sinks/sources (e.g. created by module-null-sink, module-remap-source)
+are visible alongside hardware devices.  Falls back to pure sounddevice
+enumeration when pactl is not present.
 """
 
 import os
+import subprocess
 import threading
 import time
 import json
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Union
 
 import numpy as np
 
@@ -30,46 +36,237 @@ except ImportError:
     PYDUB_AVAILABLE = False
 
 
+def _pactl_available() -> bool:
+    """Return True if the pactl CLI is reachable."""
+    try:
+        subprocess.run(
+            ["pactl", "info"],
+            capture_output=True, timeout=3,
+        )
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _parse_pactl_list(kind: str) -> List[Dict]:
+    """Parse ``pactl list sinks/sources`` into a list of device dicts.
+
+    *kind* must be ``"sinks"`` or ``"sources"``.
+    Returns a list of dicts with keys:
+        pa_name  – PulseAudio/PipeWire device name (used to open the device)
+        name     – human-readable description
+        channels – number of channels
+        samplerate – sample-rate (float)
+        state    – device state string (e.g. "RUNNING", "IDLE", "SUSPENDED")
+    """
+    try:
+        result = subprocess.run(
+            ["pactl", "list", kind],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    devices: List[Dict] = []
+    current: Dict = {}
+
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+
+        # New device block
+        if stripped.startswith(("Sink #", "Source #")):
+            if current.get("pa_name"):
+                devices.append(current)
+            current = {}
+            continue
+
+        if stripped.startswith("Name:"):
+            current["pa_name"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Description:"):
+            current["name"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("State:"):
+            current["state"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Sample Specification:"):
+            # e.g. "s16le 2ch 48000Hz"
+            spec = stripped.split(":", 1)[1].strip()
+            parts = spec.split()
+            for p in parts:
+                if p.endswith("ch"):
+                    try:
+                        current["channels"] = int(p[:-2])
+                    except ValueError:
+                        pass
+                elif p.endswith("Hz"):
+                    try:
+                        current["samplerate"] = float(p[:-2])
+                    except ValueError:
+                        pass
+
+    # Don't forget the last block
+    if current.get("pa_name"):
+        devices.append(current)
+
+    # Fill in defaults for any missing fields
+    for d in devices:
+        d.setdefault("name", d["pa_name"])
+        d.setdefault("channels", 2)
+        d.setdefault("samplerate", 48000.0)
+        d.setdefault("state", "UNKNOWN")
+
+    return devices
+
+
+def _sd_device_for_pa_name(pa_name: str) -> Optional[int]:
+    """Try to find a sounddevice index matching a PulseAudio device name."""
+    if not SD_AVAILABLE:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    for i, d in enumerate(devices):
+        if pa_name in d.get("name", ""):
+            return i
+    return None
+
+
 class AudioDevice:
-    """Manages audio device selection and enumeration."""
+    """Manages audio device selection and enumeration.
+
+    Prefers PulseAudio/PipeWire enumeration (via ``pactl``) so that virtual
+    devices such as null-sinks, remap-sources, and loopback monitors are
+    visible.  Falls back to ``sounddevice.query_devices()`` when ``pactl`` is
+    not available.
+
+    Each device dict contains:
+        index      – sounddevice index (int) or ``None`` for PA-only devices
+        pa_name    – PulseAudio device name (str) or ``None``
+        name       – human-readable label
+        channels   – channel count
+        samplerate – default sample-rate
+    """
+
+    # Cached flag – computed once per session, refreshable.
+    _pa_ok: Optional[bool] = None
+
+    @classmethod
+    def _has_pa(cls) -> bool:
+        if cls._pa_ok is None:
+            cls._pa_ok = _pactl_available()
+        return cls._pa_ok
+
+    @classmethod
+    def refresh(cls):
+        """Force re-enumeration (e.g. after creating new virtual devices)."""
+        cls._pa_ok = None
+        if SD_AVAILABLE:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
 
     @staticmethod
-    def list_input_devices() -> List[Dict]:
+    def _sd_input_devices() -> List[Dict]:
         if not SD_AVAILABLE:
             return []
         devices = sd.query_devices()
         return [
-            {"index": i, "name": d["name"], "channels": d["max_input_channels"], "samplerate": d["default_samplerate"]}
+            {"index": i, "pa_name": None, "name": d["name"],
+             "channels": d["max_input_channels"],
+             "samplerate": d["default_samplerate"]}
             for i, d in enumerate(devices)
             if d["max_input_channels"] > 0
         ]
 
     @staticmethod
-    def list_output_devices() -> List[Dict]:
+    def _sd_output_devices() -> List[Dict]:
         if not SD_AVAILABLE:
             return []
         devices = sd.query_devices()
         return [
-            {"index": i, "name": d["name"], "channels": d["max_output_channels"], "samplerate": d["default_samplerate"]}
+            {"index": i, "pa_name": None, "name": d["name"],
+             "channels": d["max_output_channels"],
+             "samplerate": d["default_samplerate"]}
             for i, d in enumerate(devices)
             if d["max_output_channels"] > 0
         ]
 
-    @staticmethod
-    def set_input_device(index: int):
-        if SD_AVAILABLE:
-            sd.default.device[0] = index
+    @classmethod
+    def list_input_devices(cls) -> List[Dict]:
+        """Return all available input (source) devices."""
+        if cls._has_pa():
+            pa_sources = _parse_pactl_list("sources")
+            # Filter out monitor sources of sinks (they are outputs, not inputs)
+            # unless they were explicitly created as remap-sources.
+            results = []
+            for d in pa_sources:
+                pa_name = d["pa_name"]
+                # .monitor suffix means it's a sink monitor – still useful as
+                # a virtual mic (e.g. DiscordMic remaps one), so include all.
+                sd_idx = _sd_device_for_pa_name(pa_name)
+                results.append({
+                    "index": sd_idx,
+                    "pa_name": pa_name,
+                    "name": d["name"],
+                    "channels": d["channels"],
+                    "samplerate": d["samplerate"],
+                })
+            return results
+
+        return cls._sd_input_devices()
+
+    @classmethod
+    def list_output_devices(cls) -> List[Dict]:
+        """Return all available output (sink) devices."""
+        if cls._has_pa():
+            pa_sinks = _parse_pactl_list("sinks")
+            results = []
+            for d in pa_sinks:
+                sd_idx = _sd_device_for_pa_name(d["pa_name"])
+                results.append({
+                    "index": sd_idx,
+                    "pa_name": d["pa_name"],
+                    "name": d["name"],
+                    "channels": d["channels"],
+                    "samplerate": d["samplerate"],
+                })
+            return results
+
+        return cls._sd_output_devices()
 
     @staticmethod
-    def set_output_device(index: int):
+    def set_input_device(device: Union[int, str]):
+        """Set default input device by sounddevice index or PA name."""
         if SD_AVAILABLE:
-            sd.default.device[1] = index
+            sd.default.device[0] = device
+
+    @staticmethod
+    def set_output_device(device: Union[int, str]):
+        """Set default output device by sounddevice index or PA name."""
+        if SD_AVAILABLE:
+            sd.default.device[1] = device
 
     @staticmethod
     def get_default_devices():
         if SD_AVAILABLE:
             return sd.default.device
         return [None, None]
+
+    @staticmethod
+    def resolve_device_id(dev: Dict) -> Union[int, str, None]:
+        """Return the best identifier to pass to sounddevice for *dev*.
+
+        Prefers the sounddevice index when available; falls back to the
+        PulseAudio device name (works on PipeWire systems via ALSA plugin).
+        """
+        if dev.get("index") is not None:
+            return dev["index"]
+        if dev.get("pa_name"):
+            return dev["pa_name"]
+        return None
 
 
 class SoundLoader:
