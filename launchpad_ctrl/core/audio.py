@@ -118,16 +118,48 @@ def _parse_pactl_list(kind: str) -> List[Dict]:
     return devices
 
 
-def _sd_device_for_pa_name(pa_name: str) -> Optional[int]:
-    """Try to find a sounddevice index matching a PulseAudio device name."""
+def _pactl_set_default(kind: str, pa_name: str):
+    """Set the PulseAudio/PipeWire default sink or source.
+
+    *kind* must be ``"sink"`` or ``"source"``.
+    """
+    try:
+        subprocess.run(
+            ["pactl", f"set-default-{kind}", pa_name],
+            capture_output=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def _sd_device_for_pa(pa_name: str, pa_description: str,
+                      direction: str) -> Optional[int]:
+    """Try to find a sounddevice index matching a PulseAudio device.
+
+    Matches by comparing the PA *description* (human-readable) against
+    sounddevice's device name, which PortAudio typically populates from the
+    same description string.  *direction* must be ``"input"`` or ``"output"``.
+    """
     if not SD_AVAILABLE:
         return None
     try:
         devices = sd.query_devices()
     except Exception:
         return None
+
+    chan_key = ("max_input_channels" if direction == "input"
+                else "max_output_channels")
+    pa_desc_lower = pa_description.lower()
+
     for i, d in enumerate(devices):
-        if pa_name in d.get("name", ""):
+        if d[chan_key] <= 0:
+            continue
+        sd_name_lower = d["name"].lower()
+        # Exact or substring match between PA description and sd name
+        if pa_desc_lower in sd_name_lower or sd_name_lower in pa_desc_lower:
+            return i
+        # Also try the PA internal name as a fallback
+        if pa_name.lower() in sd_name_lower:
             return i
     return None
 
@@ -199,14 +231,10 @@ class AudioDevice:
         """Return all available input (source) devices."""
         if cls._has_pa():
             pa_sources = _parse_pactl_list("sources")
-            # Filter out monitor sources of sinks (they are outputs, not inputs)
-            # unless they were explicitly created as remap-sources.
             results = []
             for d in pa_sources:
                 pa_name = d["pa_name"]
-                # .monitor suffix means it's a sink monitor – still useful as
-                # a virtual mic (e.g. DiscordMic remaps one), so include all.
-                sd_idx = _sd_device_for_pa_name(pa_name)
+                sd_idx = _sd_device_for_pa(pa_name, d["name"], "input")
                 results.append({
                     "index": sd_idx,
                     "pa_name": pa_name,
@@ -225,7 +253,7 @@ class AudioDevice:
             pa_sinks = _parse_pactl_list("sinks")
             results = []
             for d in pa_sinks:
-                sd_idx = _sd_device_for_pa_name(d["pa_name"])
+                sd_idx = _sd_device_for_pa(d["pa_name"], d["name"], "output")
                 results.append({
                     "index": sd_idx,
                     "pa_name": d["pa_name"],
@@ -237,17 +265,43 @@ class AudioDevice:
 
         return cls._sd_output_devices()
 
-    @staticmethod
-    def set_input_device(device: Union[int, str]):
-        """Set default input device by sounddevice index or PA name."""
-        if SD_AVAILABLE:
-            sd.default.device[0] = device
+    # Track the currently selected PA names so start()/start_recording()
+    # can set up the default sink/source before opening streams.
+    _selected_output_pa: Optional[str] = None
+    _selected_input_pa: Optional[str] = None
 
-    @staticmethod
-    def set_output_device(device: Union[int, str]):
-        """Set default output device by sounddevice index or PA name."""
+    @classmethod
+    def set_input_device(cls, device_id, pa_name: Optional[str] = None):
+        """Set default input device.
+
+        *device_id* is a sounddevice index (int) or ``None``.
+        *pa_name* is the PulseAudio device name (str) or ``None``.
+        """
+        cls._selected_input_pa = pa_name
         if SD_AVAILABLE:
-            sd.default.device[1] = device
+            if isinstance(device_id, int):
+                sd.default.device[0] = device_id
+            else:
+                # PA-only device – set PulseAudio default, sd uses system default
+                sd.default.device[0] = None
+        if pa_name:
+            _pactl_set_default("source", pa_name)
+
+    @classmethod
+    def set_output_device(cls, device_id, pa_name: Optional[str] = None):
+        """Set default output device.
+
+        *device_id* is a sounddevice index (int) or ``None``.
+        *pa_name* is the PulseAudio device name (str) or ``None``.
+        """
+        cls._selected_output_pa = pa_name
+        if SD_AVAILABLE:
+            if isinstance(device_id, int):
+                sd.default.device[1] = device_id
+            else:
+                sd.default.device[1] = None
+        if pa_name:
+            _pactl_set_default("sink", pa_name)
 
     @staticmethod
     def get_default_devices():
@@ -256,17 +310,15 @@ class AudioDevice:
         return [None, None]
 
     @staticmethod
-    def resolve_device_id(dev: Dict) -> Union[int, str, None]:
-        """Return the best identifier to pass to sounddevice for *dev*.
+    def resolve_device_info(dev: Dict):
+        """Return ``(device_id, pa_name)`` for the combo-box item data.
 
-        Prefers the sounddevice index when available; falls back to the
-        PulseAudio device name (works on PipeWire systems via ALSA plugin).
+        *device_id* is an int sounddevice index when available, else ``None``.
+        *pa_name* is the PulseAudio name string, else ``None``.
         """
-        if dev.get("index") is not None:
-            return dev["index"]
-        if dev.get("pa_name"):
-            return dev["pa_name"]
-        return None
+        sd_idx = dev.get("index")  # int or None
+        pa_name = dev.get("pa_name")  # str or None
+        return (sd_idx, pa_name)
 
 
 class SoundLoader:
@@ -413,14 +465,25 @@ class AudioEngine:
             print("[Audio] sounddevice not available")
             return
 
+        # If a PA output device was selected, ensure it is the PA default
+        # so that sounddevice (using the system default) will route to it.
+        pa_out = AudioDevice._selected_output_pa
+        if pa_out:
+            _pactl_set_default("sink", pa_out)
+
         try:
-            self._stream = sd.OutputStream(
-                samplerate=self.samplerate,
-                blocksize=self.blocksize,
-                channels=2,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
+            kwargs = {
+                "samplerate": self.samplerate,
+                "blocksize": self.blocksize,
+                "channels": 2,
+                "dtype": "float32",
+                "callback": self._audio_callback,
+            }
+            # Use explicit device index if available, otherwise system default
+            dev = sd.default.device[1]
+            if isinstance(dev, int):
+                kwargs["device"] = dev
+            self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
             print("[Audio] Engine started")
         except Exception as e:
@@ -539,13 +602,18 @@ class AudioEngine:
 
     # --- Recording ---
 
-    def start_recording(self, input_device: Optional[int] = None, channels: int = 1):
+    def start_recording(self, input_device=None, channels: int = 1):
         """Start recording from microphone."""
         if self._recording:
             return
         if not SD_AVAILABLE:
             print("[Audio] sounddevice not available for recording")
             return
+
+        # If a PA input device was selected, ensure it is the PA default
+        pa_in = AudioDevice._selected_input_pa
+        if pa_in:
+            _pactl_set_default("source", pa_in)
 
         self._record_buffer = []
         self._recording = True
@@ -557,8 +625,14 @@ class AudioEngine:
             "dtype": "float32",
             "callback": self._record_callback,
         }
-        if input_device is not None:
+        # Use explicit device index if provided and it's an int
+        if isinstance(input_device, int):
             kwargs["device"] = input_device
+        else:
+            # Fall back to sd default (int index) or system default (None)
+            dev = sd.default.device[0]
+            if isinstance(dev, int):
+                kwargs["device"] = dev
 
         try:
             self._record_stream = sd.InputStream(**kwargs)
