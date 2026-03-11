@@ -1,13 +1,19 @@
 """
 Audio engine for playback, recording, and device management.
 Supports WAV, OGG, and MP3 (via pydub/ffmpeg).
+
+Device enumeration uses PulseAudio/PipeWire (via pactl) when available so that
+virtual sinks/sources (e.g. created by module-null-sink, module-remap-source)
+are visible alongside hardware devices.  Falls back to pure sounddevice
+enumeration when pactl is not present.
 """
 
 import os
+import subprocess
 import threading
 import time
 import json
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Union
 
 import numpy as np
 
@@ -30,46 +36,489 @@ except ImportError:
     PYDUB_AVAILABLE = False
 
 
+def _pactl_available() -> bool:
+    """Return True if the pactl CLI is reachable."""
+    try:
+        subprocess.run(
+            ["pactl", "info"],
+            capture_output=True, timeout=3,
+        )
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _parse_pactl_list(kind: str) -> List[Dict]:
+    """Parse ``pactl list sinks/sources`` into a list of device dicts.
+
+    *kind* must be ``"sinks"`` or ``"sources"``.
+    Returns a list of dicts with keys:
+        pa_name  – PulseAudio/PipeWire device name (used to open the device)
+        name     – human-readable description
+        channels – number of channels
+        samplerate – sample-rate (float)
+        state    – device state string (e.g. "RUNNING", "IDLE", "SUSPENDED")
+    """
+    try:
+        result = subprocess.run(
+            ["pactl", "list", kind],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    devices: List[Dict] = []
+    current: Dict = {}
+
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+
+        # New device block
+        if stripped.startswith(("Sink #", "Source #")):
+            if current.get("pa_name"):
+                devices.append(current)
+            current = {}
+            continue
+
+        if stripped.startswith("Name:"):
+            current["pa_name"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Description:"):
+            current["name"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("State:"):
+            current["state"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Sample Specification:"):
+            # e.g. "s16le 2ch 48000Hz"
+            spec = stripped.split(":", 1)[1].strip()
+            parts = spec.split()
+            for p in parts:
+                if p.endswith("ch"):
+                    try:
+                        current["channels"] = int(p[:-2])
+                    except ValueError:
+                        pass
+                elif p.endswith("Hz"):
+                    try:
+                        current["samplerate"] = float(p[:-2])
+                    except ValueError:
+                        pass
+
+    # Don't forget the last block
+    if current.get("pa_name"):
+        devices.append(current)
+
+    # Fill in defaults for any missing fields
+    for d in devices:
+        d.setdefault("name", d["pa_name"])
+        d.setdefault("channels", 2)
+        d.setdefault("samplerate", 48000.0)
+        d.setdefault("state", "UNKNOWN")
+
+    return devices
+
+
+def _pulse_env_set(pa_name: Optional[str], direction: str):
+    """Set or clear the ``PULSE_SINK`` / ``PULSE_SOURCE`` env-var.
+
+    When PortAudio opens a stream through PulseAudio/PipeWire it honours
+    these variables to route *that specific stream* to the named device
+    **without** changing the system-wide default.
+
+    *direction* must be ``"output"`` (sets ``PULSE_SINK``) or
+    ``"input"`` (sets ``PULSE_SOURCE``).
+
+    NOTE: On Arch Linux with PipeWire, PortAudio typically uses the ALSA
+    backend (via pipewire-alsa), which ignores these env-vars.  We set them
+    anyway as a best-effort, but the real routing is done by
+    ``_pactl_move_stream_to_device()`` after the stream is opened.
+    """
+    env_key = "PULSE_SINK" if direction == "output" else "PULSE_SOURCE"
+    if pa_name:
+        os.environ[env_key] = pa_name
+        print(f"[Audio][DEBUG] Set {env_key}={pa_name}")
+    else:
+        os.environ.pop(env_key, None)
+        print(f"[Audio][DEBUG] Cleared {env_key}")
+
+
+def _pactl_move_stream_to_device(pa_name: str, direction: str,
+                                  known_stream_ids: Optional[set] = None):
+    """Move our process's PulseAudio/PipeWire stream(s) to the given device.
+
+    After PortAudio opens a stream, PipeWire registers it as a sink-input
+    (playback) or source-output (recording).  This function identifies our
+    stream and moves it to *pa_name*.
+
+    Identification strategy (PipeWire+ALSA-backend doesn't expose PID):
+      1. Match by ``application.process.id`` (works on native PulseAudio).
+      2. Match by ``application.name`` containing "python" – this is what
+         PipeWire's ALSA backend sets for Python programs (e.g.
+         ``PipeWire ALSA [python3.10]``).
+      3. Use *known_stream_ids* (IDs that existed before we opened our
+         stream) to find the NEW stream that appeared since.
+
+    *direction* must be ``"output"`` or ``"input"``.
+    Returns the set of stream IDs that were successfully moved.
+    """
+    our_pid = str(os.getpid())
+
+    if direction == "output":
+        list_cmd = ["pactl", "list", "sink-inputs"]
+        move_cmd_prefix = ["pactl", "move-sink-input"]
+        stream_label = "Sink Input"
+        id_prefix = "Sink Input #"
+    else:
+        list_cmd = ["pactl", "list", "source-outputs"]
+        move_cmd_prefix = ["pactl", "move-source-output"]
+        stream_label = "Source Output"
+        id_prefix = "Source Output #"
+
+    try:
+        result = subprocess.run(
+            list_cmd, capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            print(f"[Audio][DEBUG] pactl list failed: {result.stderr.strip()}")
+            return set()
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"[Audio][DEBUG] pactl not available: {e}")
+        return set()
+
+    print(f"[Audio][DEBUG] Looking for {stream_label}s (PID={our_pid})")
+
+    # Parse all stream blocks
+    streams = _parse_stream_blocks(result.stdout, id_prefix)
+
+    if streams:
+        print(f"[Audio][DEBUG] All {stream_label}s currently registered:")
+        for s in streams:
+            print(f"[Audio][DEBUG]   #{s['id']}  PID={s['pid']}  "
+                  f"app={s['app']!r}  binary={s['binary']!r}")
+
+    # --- Strategy 1: exact PID match ---
+    matched = [s for s in streams if s["pid"] == our_pid]
+
+    # --- Strategy 2: app name contains "python" (PipeWire ALSA backend) ---
+    if not matched:
+        matched = [s for s in streams
+                   if "python" in s["app"].lower()]
+        if matched:
+            print(f"[Audio][DEBUG] PID not found, matched {len(matched)} stream(s) "
+                  f"by app name containing 'python'")
+
+    # --- Strategy 3: new stream ID not in known_stream_ids ---
+    if not matched and known_stream_ids is not None:
+        matched = [s for s in streams
+                   if s["id"] not in known_stream_ids]
+        if matched:
+            print(f"[Audio][DEBUG] Matched {len(matched)} NEW stream(s) "
+                  f"(not in pre-existing set)")
+
+    moved_ids = set()
+    for s in matched:
+        if _do_move(move_cmd_prefix, s["id"], pa_name, stream_label):
+            moved_ids.add(s["id"])
+
+    if not moved_ids:
+        print(f"[Audio][DEBUG] WARNING: Could not find/move any {stream_label}s")
+    else:
+        print(f"[Audio][DEBUG] Moved {len(moved_ids)} {stream_label}(s) -> {pa_name}")
+
+    return moved_ids
+
+
+def _parse_stream_blocks(pactl_output: str, id_prefix: str) -> List[Dict]:
+    """Parse ``pactl list sink-inputs / source-outputs`` into a list of dicts.
+
+    Each dict has keys: id, pid, app, binary.
+    """
+    streams: List[Dict] = []
+    current: Optional[Dict] = None
+
+    for line in pactl_output.splitlines():
+        stripped = line.strip()
+
+        if stripped.startswith(id_prefix):
+            if current is not None:
+                streams.append(current)
+            current = {
+                "id": stripped[len(id_prefix):],
+                "pid": "?",
+                "app": "?",
+                "binary": "?",
+            }
+            continue
+
+        if current is None:
+            continue
+
+        # Properties we care about
+        if "application.process.id" in stripped:
+            val = _prop_value(stripped)
+            if val:
+                current["pid"] = val
+        elif "application.name" in stripped and "icon" not in stripped:
+            val = _prop_value(stripped)
+            if val:
+                current["app"] = val
+        elif "application.process.binary" in stripped:
+            val = _prop_value(stripped)
+            if val:
+                current["binary"] = val
+
+    if current is not None:
+        streams.append(current)
+    return streams
+
+
+def _prop_value(line: str) -> Optional[str]:
+    """Extract the value from a ``key = "value"`` pactl property line."""
+    parts = line.split("=", 1)
+    if len(parts) == 2:
+        return parts[1].strip().strip('"').strip("'")
+    return None
+
+
+def _do_move(cmd_prefix: list, stream_id: str, pa_name: str,
+             label: str) -> bool:
+    """Execute ``pactl move-sink-input / move-source-output``.
+
+    Returns True on success.
+    """
+    cmd = cmd_prefix + [stream_id, pa_name]
+    print(f"[Audio][DEBUG] Running: {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            print(f"[Audio][DEBUG] Move failed: {r.stderr.strip()}")
+            return False
+        print(f"[Audio][DEBUG] Successfully moved {label} #{stream_id} -> {pa_name}")
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"[Audio][DEBUG] Move error: {e}")
+        return False
+
+
+def _get_current_stream_ids(direction: str) -> set:
+    """Return the set of currently registered stream IDs.
+
+    Used to snapshot IDs *before* opening a new stream, so we can identify
+    the new one by diffing.
+    """
+    if direction == "output":
+        list_cmd = ["pactl", "list", "short", "sink-inputs"]
+    else:
+        list_cmd = ["pactl", "list", "short", "source-outputs"]
+
+    try:
+        r = subprocess.run(list_cmd, capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return set()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return set()
+
+    ids = set()
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if parts:
+            ids.add(parts[0])
+    print(f"[Audio][DEBUG] Pre-existing stream IDs ({direction}): {ids}")
+    return ids
+
+
+def _sd_device_for_pa(pa_name: str, pa_description: str,
+                      direction: str) -> Optional[int]:
+    """Try to find a sounddevice index matching a PulseAudio device.
+
+    Matches by comparing the PA *description* (human-readable) against
+    sounddevice's device name, which PortAudio typically populates from the
+    same description string.  *direction* must be ``"input"`` or ``"output"``.
+    """
+    if not SD_AVAILABLE:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+
+    chan_key = ("max_input_channels" if direction == "input"
+                else "max_output_channels")
+    pa_desc_lower = pa_description.lower()
+
+    for i, d in enumerate(devices):
+        if d[chan_key] <= 0:
+            continue
+        sd_name_lower = d["name"].lower()
+        # Exact or substring match between PA description and sd name
+        if pa_desc_lower in sd_name_lower or sd_name_lower in pa_desc_lower:
+            return i
+        # Also try the PA internal name as a fallback
+        if pa_name.lower() in sd_name_lower:
+            return i
+    return None
+
+
 class AudioDevice:
-    """Manages audio device selection and enumeration."""
+    """Manages audio device selection and enumeration.
+
+    Prefers PulseAudio/PipeWire enumeration (via ``pactl``) so that virtual
+    devices such as null-sinks, remap-sources, and loopback monitors are
+    visible.  Falls back to ``sounddevice.query_devices()`` when ``pactl`` is
+    not available.
+
+    Each device dict contains:
+        index      – sounddevice index (int) or ``None`` for PA-only devices
+        pa_name    – PulseAudio device name (str) or ``None``
+        name       – human-readable label
+        channels   – channel count
+        samplerate – default sample-rate
+    """
+
+    # Cached flag – computed once per session, refreshable.
+    _pa_ok: Optional[bool] = None
+
+    @classmethod
+    def _has_pa(cls) -> bool:
+        if cls._pa_ok is None:
+            cls._pa_ok = _pactl_available()
+        return cls._pa_ok
+
+    @classmethod
+    def refresh(cls):
+        """Force re-enumeration (e.g. after creating new virtual devices)."""
+        cls._pa_ok = None
+        if SD_AVAILABLE:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
 
     @staticmethod
-    def list_input_devices() -> List[Dict]:
+    def _sd_input_devices() -> List[Dict]:
         if not SD_AVAILABLE:
             return []
         devices = sd.query_devices()
         return [
-            {"index": i, "name": d["name"], "channels": d["max_input_channels"], "samplerate": d["default_samplerate"]}
+            {"index": i, "pa_name": None, "name": d["name"],
+             "channels": d["max_input_channels"],
+             "samplerate": d["default_samplerate"]}
             for i, d in enumerate(devices)
             if d["max_input_channels"] > 0
         ]
 
     @staticmethod
-    def list_output_devices() -> List[Dict]:
+    def _sd_output_devices() -> List[Dict]:
         if not SD_AVAILABLE:
             return []
         devices = sd.query_devices()
         return [
-            {"index": i, "name": d["name"], "channels": d["max_output_channels"], "samplerate": d["default_samplerate"]}
+            {"index": i, "pa_name": None, "name": d["name"],
+             "channels": d["max_output_channels"],
+             "samplerate": d["default_samplerate"]}
             for i, d in enumerate(devices)
             if d["max_output_channels"] > 0
         ]
 
-    @staticmethod
-    def set_input_device(index: int):
-        if SD_AVAILABLE:
-            sd.default.device[0] = index
+    @classmethod
+    def list_input_devices(cls) -> List[Dict]:
+        """Return all available input (source) devices."""
+        if cls._has_pa():
+            pa_sources = _parse_pactl_list("sources")
+            results = []
+            for d in pa_sources:
+                pa_name = d["pa_name"]
+                sd_idx = _sd_device_for_pa(pa_name, d["name"], "input")
+                results.append({
+                    "index": sd_idx,
+                    "pa_name": pa_name,
+                    "name": d["name"],
+                    "channels": d["channels"],
+                    "samplerate": d["samplerate"],
+                })
+            return results
 
-    @staticmethod
-    def set_output_device(index: int):
+        return cls._sd_input_devices()
+
+    @classmethod
+    def list_output_devices(cls) -> List[Dict]:
+        """Return all available output (sink) devices."""
+        if cls._has_pa():
+            pa_sinks = _parse_pactl_list("sinks")
+            print(f"[Audio][DEBUG] pactl found {len(pa_sinks)} sink(s):")
+            results = []
+            for d in pa_sinks:
+                sd_idx = _sd_device_for_pa(d["pa_name"], d["name"], "output")
+                print(f"[Audio][DEBUG]   sink: {d['pa_name']!r} "
+                      f"desc={d['name']!r} sd_idx={sd_idx}")
+                results.append({
+                    "index": sd_idx,
+                    "pa_name": d["pa_name"],
+                    "name": d["name"],
+                    "channels": d["channels"],
+                    "samplerate": d["samplerate"],
+                })
+            return results
+
+        print("[Audio][DEBUG] pactl not available, falling back to sounddevice")
+        return cls._sd_output_devices()
+
+    # Track the currently selected PA names so start()/start_recording()
+    # can set up the default sink/source before opening streams.
+    _selected_output_pa: Optional[str] = None
+    _selected_input_pa: Optional[str] = None
+
+    @classmethod
+    def set_input_device(cls, device_id, pa_name: Optional[str] = None):
+        """Set default input device.
+
+        *device_id* is a sounddevice index (int) or ``None``.
+        *pa_name* is the PulseAudio device name (str) or ``None``.
+        """
+        print(f"[Audio][DEBUG] set_input_device(device_id={device_id!r}, pa_name={pa_name!r})")
+        cls._selected_input_pa = pa_name
         if SD_AVAILABLE:
-            sd.default.device[1] = index
+            if isinstance(device_id, int):
+                sd.default.device[0] = device_id
+            else:
+                sd.default.device[0] = None
+        # Set env-var (best-effort; real routing done via pactl move)
+        _pulse_env_set(pa_name, "input")
+
+    @classmethod
+    def set_output_device(cls, device_id, pa_name: Optional[str] = None):
+        """Set default output device.
+
+        *device_id* is a sounddevice index (int) or ``None``.
+        *pa_name* is the PulseAudio device name (str) or ``None``.
+        """
+        print(f"[Audio][DEBUG] set_output_device(device_id={device_id!r}, pa_name={pa_name!r})")
+        cls._selected_output_pa = pa_name
+        if SD_AVAILABLE:
+            if isinstance(device_id, int):
+                sd.default.device[1] = device_id
+            else:
+                sd.default.device[1] = None
+        # Set env-var (best-effort; real routing done via pactl move)
+        _pulse_env_set(pa_name, "output")
 
     @staticmethod
     def get_default_devices():
         if SD_AVAILABLE:
             return sd.default.device
         return [None, None]
+
+    @staticmethod
+    def resolve_device_info(dev: Dict):
+        """Return ``(device_id, pa_name)`` for the combo-box item data.
+
+        *device_id* is an int sounddevice index when available, else ``None``.
+        *pa_name* is the PulseAudio name string, else ``None``.
+        """
+        sd_idx = dev.get("index")  # int or None
+        pa_name = dev.get("pa_name")  # str or None
+        return (sd_idx, pa_name)
 
 
 class SoundLoader:
@@ -216,21 +665,68 @@ class AudioEngine:
             print("[Audio] sounddevice not available")
             return
 
+        pa_out = AudioDevice._selected_output_pa
+        print(f"[Audio][DEBUG] start() called — selected PA output: {pa_out!r}")
+        print(f"[Audio][DEBUG] sd.default.device = {sd.default.device}")
+
+        # Set env-var (works when PortAudio uses PulseAudio backend)
+        _pulse_env_set(pa_out, "output")
+
+        # Snapshot existing stream IDs so we can find the NEW one we create
+        pre_ids = _get_current_stream_ids("output") if pa_out else set()
+
         try:
-            self._stream = sd.OutputStream(
-                samplerate=self.samplerate,
-                blocksize=self.blocksize,
-                channels=2,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
+            kwargs = {
+                "samplerate": self.samplerate,
+                "blocksize": self.blocksize,
+                "channels": 2,
+                "dtype": "float32",
+                "callback": self._audio_callback,
+            }
+            dev = sd.default.device[1]
+            if isinstance(dev, int):
+                kwargs["device"] = dev
+                print(f"[Audio][DEBUG] Using sounddevice index {dev}")
+            else:
+                print("[Audio][DEBUG] No sd index — using system default device")
+
+            self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
             print("[Audio] Engine started")
+
+            # On PipeWire/ALSA-backend systems, PULSE_SINK is ignored.
+            # Move our stream to the target sink via pactl after it's opened.
+            if pa_out:
+                threading.Thread(
+                    target=self._move_output_stream,
+                    args=(pa_out, pre_ids),
+                    daemon=True,
+                ).start()
+
         except Exception as e:
             print(f"[Audio] Failed to start: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _move_output_stream(self, pa_name: str, pre_ids: set):
+        """Move our output stream to *pa_name* (runs in a background thread).
+
+        Retries a few times because PipeWire may take a moment to register the
+        new PortAudio stream as a sink-input.
+        """
+        for attempt in range(5):
+            time.sleep(0.2 * (attempt + 1))  # 200ms, 400ms, 600ms …
+            print(f"[Audio][DEBUG] move-output attempt {attempt + 1}/5")
+            moved = _pactl_move_stream_to_device(pa_name, "output", pre_ids)
+            if moved:
+                print(f"[Audio][DEBUG] Stream successfully routed to {pa_name}")
+                return
+        print(f"[Audio][DEBUG] WARNING: Could not move stream to {pa_name} "
+              f"after 5 attempts")
 
     def restart(self):
         """Restart the audio output stream (e.g., after device change)."""
+        print("[Audio][DEBUG] restart() called — stopping current stream and re-opening")
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -342,13 +838,22 @@ class AudioEngine:
 
     # --- Recording ---
 
-    def start_recording(self, input_device: Optional[int] = None, channels: int = 1):
+    def start_recording(self, input_device=None, channels: int = 1):
         """Start recording from microphone."""
         if self._recording:
             return
         if not SD_AVAILABLE:
             print("[Audio] sounddevice not available for recording")
             return
+
+        pa_in = AudioDevice._selected_input_pa
+        print(f"[Audio][DEBUG] start_recording() — selected PA input: {pa_in!r}")
+
+        # Set env-var (works when PortAudio uses PulseAudio backend)
+        _pulse_env_set(pa_in, "input")
+
+        # Snapshot existing stream IDs so we can find the NEW one
+        pre_ids = _get_current_stream_ids("input") if pa_in else set()
 
         self._record_buffer = []
         self._recording = True
@@ -360,16 +865,47 @@ class AudioEngine:
             "dtype": "float32",
             "callback": self._record_callback,
         }
-        if input_device is not None:
+        if isinstance(input_device, int):
             kwargs["device"] = input_device
+            print(f"[Audio][DEBUG] Recording with explicit device index: {input_device}")
+        else:
+            dev = sd.default.device[0]
+            if isinstance(dev, int):
+                kwargs["device"] = dev
+                print(f"[Audio][DEBUG] Recording with sd default index: {dev}")
+            else:
+                print("[Audio][DEBUG] Recording with system default device")
 
         try:
             self._record_stream = sd.InputStream(**kwargs)
             self._record_stream.start()
             print("[Audio] Recording started")
+
+            # Move to the correct source via pactl (PipeWire/ALSA-backend fix)
+            if pa_in:
+                threading.Thread(
+                    target=self._move_input_stream,
+                    args=(pa_in, pre_ids),
+                    daemon=True,
+                ).start()
+
         except Exception as e:
             print(f"[Audio] Record start error: {e}")
+            import traceback
+            traceback.print_exc()
             self._recording = False
+
+    def _move_input_stream(self, pa_name: str, pre_ids: set):
+        """Move our input stream to *pa_name* (runs in a background thread)."""
+        for attempt in range(5):
+            time.sleep(0.2 * (attempt + 1))
+            print(f"[Audio][DEBUG] move-input attempt {attempt + 1}/5")
+            moved = _pactl_move_stream_to_device(pa_name, "input", pre_ids)
+            if moved:
+                print(f"[Audio][DEBUG] Input stream routed to {pa_name}")
+                return
+        print(f"[Audio][DEBUG] WARNING: Could not move input stream to {pa_name} "
+              f"after 5 attempts")
 
     def stop_recording(self) -> Optional[np.ndarray]:
         """Stop recording and return the recorded data."""

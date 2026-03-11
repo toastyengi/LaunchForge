@@ -873,6 +873,9 @@ class MainWindow(QMainWindow):
     # --- Audio Device Handling ---
 
     def _refresh_audio_devices(self):
+        # Force re-enumeration so newly created virtual devices appear.
+        AudioDevice.refresh()
+
         # Block signals while populating to avoid overriding the system
         # default output device before the audio stream is started.
         self._output_combo.blockSignals(True)
@@ -883,22 +886,27 @@ class MainWindow(QMainWindow):
 
         outputs = AudioDevice.list_output_devices()
         for dev in outputs:
-            self._output_combo.addItem(f"{dev['name']}", dev["index"])
+            info = AudioDevice.resolve_device_info(dev)
+            self._output_combo.addItem(dev['name'], info)
 
         inputs = AudioDevice.list_input_devices()
         for dev in inputs:
-            self._input_combo.addItem(f"{dev['name']}", dev["index"])
+            info = AudioDevice.resolve_device_info(dev)
+            self._input_combo.addItem(dev['name'], info)
 
-        # Select the current default device in the combo without triggering a change
+        # Select the current default device in the combo without triggering
+        # a change.  Match by sounddevice index when available.
         defaults = AudioDevice.get_default_devices()
         if defaults[1] is not None:
             for i in range(self._output_combo.count()):
-                if self._output_combo.itemData(i) == defaults[1]:
+                sd_idx, _pa = self._output_combo.itemData(i)
+                if sd_idx == defaults[1]:
                     self._output_combo.setCurrentIndex(i)
                     break
         if defaults[0] is not None:
             for i in range(self._input_combo.count()):
-                if self._input_combo.itemData(i) == defaults[0]:
+                sd_idx, _pa = self._input_combo.itemData(i)
+                if sd_idx == defaults[0]:
                     self._input_combo.setCurrentIndex(i)
                     break
 
@@ -907,18 +915,20 @@ class MainWindow(QMainWindow):
 
     def _on_output_device_changed(self, index):
         if index >= 0:
-            dev_index = self._output_combo.itemData(index)
-            if dev_index is not None:
-                AudioDevice.set_output_device(dev_index)
+            info = self._output_combo.itemData(index)
+            if info is not None:
+                sd_idx, pa_name = info
+                AudioDevice.set_output_device(sd_idx, pa_name)
                 # Restart the audio stream so it uses the newly selected device
                 self.audio.restart()
                 self._statusbar.showMessage(f"Output: {self._output_combo.currentText()}")
 
     def _on_input_device_changed(self, index):
         if index >= 0:
-            dev_index = self._input_combo.itemData(index)
-            if dev_index is not None:
-                AudioDevice.set_input_device(dev_index)
+            info = self._input_combo.itemData(index)
+            if info is not None:
+                sd_idx, pa_name = info
+                AudioDevice.set_input_device(sd_idx, pa_name)
                 self._statusbar.showMessage(f"Input: {self._input_combo.currentText()}")
 
     def _on_master_volume(self, value):
