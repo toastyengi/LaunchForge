@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont, QIcon
 from launchpad_ctrl.ui.grid_widget import LaunchpadGrid
 from launchpad_ctrl.ui.theme import DARK_THEME
 from launchpad_ctrl.core import LaunchpadMIDI, LPColor
-from launchpad_ctrl.core.audio import AudioEngine, AudioDevice
+from launchpad_ctrl.core.audio import AudioEngine, AudioDevice, VirtualAudioRouter
 from launchpad_ctrl.modes import ModeManager
 from launchpad_ctrl.modes.sequencer import StepSequencerMode
 from launchpad_ctrl.modes.soundboard import SoundboardMode, PadConfig
@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         # Core systems
         self.midi = LaunchpadMIDI()
         self.audio = AudioEngine()
+        self.virtual_router = VirtualAudioRouter()
         self.mode_manager = ModeManager(self.midi, self.audio)
 
         # Register modes
@@ -248,6 +249,41 @@ class MainWindow(QMainWindow):
         layout.addWidget(refresh_btn)
 
         self._refresh_audio_devices()
+
+        # --- Virtual Audio Output (feed audio into Discord / games) ---
+        virt_group = QGroupBox("Virtual Audio Output")
+        virt_layout = QVBoxLayout(virt_group)
+
+        virt_desc = QLabel(
+            "Create a virtual microphone that captures this app's audio "
+            "(optionally mixed with your real mic). Select "
+            f"\"{VirtualAudioRouter.VIRTUAL_MIC}\" as your input device "
+            "in Discord, games, etc."
+        )
+        virt_desc.setWordWrap(True)
+        virt_desc.setStyleSheet("color: #aaa; font-size: 11px;")
+        virt_layout.addWidget(virt_desc)
+
+        self._virt_mic_check = QPushButton("Enable Virtual Mic")
+        self._virt_mic_check.setCheckable(True)
+        self._virt_mic_check.setChecked(False)
+        self._virt_mic_check.clicked.connect(self._on_virtual_mic_toggled)
+        virt_layout.addWidget(self._virt_mic_check)
+
+        self._virt_mix_real_mic = QPushButton("Mix Real Mic Into Virtual Mic")
+        self._virt_mix_real_mic.setCheckable(True)
+        self._virt_mix_real_mic.setChecked(True)
+        self._virt_mix_real_mic.setToolTip(
+            "When enabled, your selected input device (real mic) is mixed "
+            "into the virtual mic alongside the app audio."
+        )
+        virt_layout.addWidget(self._virt_mix_real_mic)
+
+        self._virt_status_label = QLabel("")
+        self._virt_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        virt_layout.addWidget(self._virt_status_label)
+
+        layout.addWidget(virt_group)
 
         layout.addStretch()
         return widget
@@ -935,6 +971,73 @@ class MainWindow(QMainWindow):
         self.audio.master_volume = value / 100.0
         self._vol_label.setText(f"{value}%")
 
+    # --- Virtual Audio Output ---
+
+    def _on_virtual_mic_toggled(self, checked):
+        if checked:
+            # Determine the real mic source (from Input Device combo)
+            mic_source = None
+            if self._virt_mix_real_mic.isChecked():
+                mic_source = AudioDevice._selected_input_pa
+                if not mic_source:
+                    idx = self._input_combo.currentIndex()
+                    if idx >= 0:
+                        info = self._input_combo.itemData(idx)
+                        if info:
+                            _, mic_source = info
+
+            # Determine the current output sink for local monitoring
+            monitor_sink = AudioDevice._selected_output_pa
+            if not monitor_sink:
+                idx = self._output_combo.currentIndex()
+                if idx >= 0:
+                    info = self._output_combo.itemData(idx)
+                    if info:
+                        _, monitor_sink = info
+
+            ok = self.virtual_router.enable(
+                mic_source=mic_source,
+                monitor_sink=monitor_sink,
+            )
+            if ok:
+                # Refresh devices so the new sinks/sources appear in combos
+                self._refresh_audio_devices()
+
+                # Auto-select SoundboardSink as output so the app routes there
+                for i in range(self._output_combo.count()):
+                    info = self._output_combo.itemData(i)
+                    if info and info[1] == VirtualAudioRouter.SOUNDBOARD_SINK:
+                        self._output_combo.setCurrentIndex(i)
+                        break
+
+                self._virt_mic_check.setText("Disable Virtual Mic")
+                self._virt_mic_check.setStyleSheet(
+                    "background-color: #2a5a2a; border: 1px solid #4a8a4a;"
+                )
+                self._virt_status_label.setText(
+                    f"Active — select \"{VirtualAudioRouter.VIRTUAL_MIC}\" "
+                    f"in Discord / your game"
+                )
+                self._virt_status_label.setStyleSheet(
+                    "color: #6c6; font-size: 11px;"
+                )
+                self._statusbar.showMessage("Virtual mic enabled")
+            else:
+                self._virt_mic_check.setChecked(False)
+                self._virt_status_label.setText(
+                    "Failed — is PulseAudio / PipeWire running?"
+                )
+                self._virt_status_label.setStyleSheet(
+                    "color: #c66; font-size: 11px;"
+                )
+        else:
+            self.virtual_router.disable()
+            self._virt_mic_check.setText("Enable Virtual Mic")
+            self._virt_mic_check.setStyleSheet("")
+            self._virt_status_label.setText("")
+            self._refresh_audio_devices()
+            self._statusbar.showMessage("Virtual mic disabled")
+
     # --- MIDI Connection ---
 
     def _refresh_midi_ports(self):
@@ -1373,5 +1476,6 @@ class MainWindow(QMainWindow):
         self._sequencer.stop_playback()
         self.midi.clear_all()
         self.midi.disconnect()
+        self.virtual_router.disable()
         self.audio.stop()
         event.accept()

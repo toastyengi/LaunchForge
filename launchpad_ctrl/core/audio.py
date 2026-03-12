@@ -947,3 +947,231 @@ class AudioEngine:
         except Exception as e:
             print(f"[Audio] Save error: {e}")
             return False
+
+
+class VirtualAudioRouter:
+    """Manages virtual PulseAudio/PipeWire sinks and sources for routing
+    application audio into a virtual microphone (e.g. for Discord, games).
+
+    Creates:
+      - *SoundboardSink*  – null sink that the app routes its audio into
+      - *VirtualMix*      – null sink that combines soundboard audio + real mic
+      - *VirtualMic*      – remap-source (virtual microphone) from VirtualMix
+
+    Loopbacks:
+      - SoundboardSink.monitor → VirtualMix   (app audio into virtual mic)
+      - real mic              → VirtualMix   (voice into virtual mic)
+      - SoundboardSink.monitor → real output  (so the user still hears audio)
+    """
+
+    SOUNDBOARD_SINK = "LF_SoundboardSink"
+    MIX_SINK = "LF_VirtualMix"
+    VIRTUAL_MIC = "LF_VirtualMic"
+
+    def __init__(self):
+        # Module IDs returned by pactl load-module, used for teardown
+        self._module_ids: List[int] = []
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    # ------------------------------------------------------------------
+    # pactl helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_sink(name: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in r.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[1] == name:
+                    return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return False
+
+    @staticmethod
+    def _has_source(name: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in r.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[1] == name:
+                    return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return False
+
+    @staticmethod
+    def _load_module(module: str, **kwargs) -> Optional[int]:
+        """Load a PulseAudio module, return module ID or None."""
+        args = [f"{k}={v}" for k, v in kwargs.items()]
+        cmd = ["pactl", "load-module", module] + args
+        print(f"[VirtualAudio] Running: {' '.join(cmd)}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                print(f"[VirtualAudio] Failed: {r.stderr.strip()}")
+                return None
+            mid = int(r.stdout.strip())
+            print(f"[VirtualAudio] Loaded module {module} -> id {mid}")
+            return mid
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError) as e:
+            print(f"[VirtualAudio] Error: {e}")
+            return None
+
+    @staticmethod
+    def _unload_module(module_id: int) -> bool:
+        try:
+            r = subprocess.run(
+                ["pactl", "unload-module", str(module_id)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                print(f"[VirtualAudio] Unloaded module {module_id}")
+                return True
+            print(f"[VirtualAudio] Unload failed: {r.stderr.strip()}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"[VirtualAudio] Unload error: {e}")
+        return False
+
+    @staticmethod
+    def _has_loopback(source: str, sink: str) -> bool:
+        """Check if a loopback module with the given source/sink already exists."""
+        try:
+            r = subprocess.run(
+                ["pactl", "list", "short", "modules"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in r.stdout.splitlines():
+                if "module-loopback" in line and source in line and sink in line:
+                    return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return False
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def enable(self, mic_source: Optional[str] = None,
+               monitor_sink: Optional[str] = None) -> bool:
+        """Create the virtual audio routing.
+
+        *mic_source* – PA name of the real microphone to mix in (or None to
+                       skip mic mixing).
+        *monitor_sink* – PA name of the real output sink for local monitoring
+                         (so the user can still hear the soundboard audio).
+
+        Returns True if all essential modules were created successfully.
+        """
+        if self._active:
+            print("[VirtualAudio] Already active")
+            return True
+
+        if not _pactl_available():
+            print("[VirtualAudio] pactl not available — cannot create virtual audio")
+            return False
+
+        self._module_ids = []
+
+        # 1. SoundboardSink (null sink – app sends audio here)
+        if not self._has_sink(self.SOUNDBOARD_SINK):
+            mid = self._load_module(
+                "module-null-sink",
+                sink_name=self.SOUNDBOARD_SINK,
+                sink_properties=f"device.description={self.SOUNDBOARD_SINK}",
+            )
+            if mid is None:
+                self._teardown()
+                return False
+            self._module_ids.append(mid)
+
+        # 2. VirtualMix (null sink – combines soundboard + mic)
+        if not self._has_sink(self.MIX_SINK):
+            mid = self._load_module(
+                "module-null-sink",
+                sink_name=self.MIX_SINK,
+                sink_properties=f"device.description={self.MIX_SINK}",
+            )
+            if mid is None:
+                self._teardown()
+                return False
+            self._module_ids.append(mid)
+
+        # 3. Loopback: SoundboardSink.monitor → VirtualMix
+        sb_monitor = f"{self.SOUNDBOARD_SINK}.monitor"
+        if not self._has_loopback(sb_monitor, self.MIX_SINK):
+            mid = self._load_module(
+                "module-loopback",
+                source=sb_monitor,
+                sink=self.MIX_SINK,
+                latency_msec="1",
+            )
+            if mid is not None:
+                self._module_ids.append(mid)
+
+        # 4. Loopback: real mic → VirtualMix (so voice goes into the virtual mic)
+        if mic_source:
+            if not self._has_loopback(mic_source, self.MIX_SINK):
+                mid = self._load_module(
+                    "module-loopback",
+                    source=mic_source,
+                    sink=self.MIX_SINK,
+                    latency_msec="1",
+                )
+                if mid is not None:
+                    self._module_ids.append(mid)
+
+        # 5. VirtualMic (remap-source from VirtualMix.monitor)
+        if not self._has_source(self.VIRTUAL_MIC):
+            mid = self._load_module(
+                "module-remap-source",
+                **{
+                    "master": f"{self.MIX_SINK}.monitor",
+                    "source_name": self.VIRTUAL_MIC,
+                    "source_properties": f"device.description={self.VIRTUAL_MIC}",
+                },
+            )
+            if mid is not None:
+                self._module_ids.append(mid)
+
+        # 6. Loopback: SoundboardSink.monitor → real output (local monitoring)
+        if monitor_sink:
+            if not self._has_loopback(sb_monitor, monitor_sink):
+                mid = self._load_module(
+                    "module-loopback",
+                    source=sb_monitor,
+                    sink=monitor_sink,
+                    latency_msec="1",
+                )
+                if mid is not None:
+                    self._module_ids.append(mid)
+
+        self._active = True
+        print(f"[VirtualAudio] Enabled — {len(self._module_ids)} modules loaded")
+        print(f"[VirtualAudio] Virtual mic available as: {self.VIRTUAL_MIC}")
+        return True
+
+    def disable(self):
+        """Remove all virtual audio modules created by enable()."""
+        if not self._active:
+            return
+        self._teardown()
+        self._active = False
+        print("[VirtualAudio] Disabled — all modules unloaded")
+
+    def _teardown(self):
+        """Unload all tracked modules (reverse order)."""
+        for mid in reversed(self._module_ids):
+            self._unload_module(mid)
+        self._module_ids.clear()
