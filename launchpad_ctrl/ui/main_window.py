@@ -248,8 +248,6 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self._refresh_audio_devices)
         layout.addWidget(refresh_btn)
 
-        self._refresh_audio_devices()
-
         # --- Virtual Audio Output (feed audio into Discord / games) ---
         virt_group = QGroupBox("Virtual Audio Output")
         virt_layout = QVBoxLayout(virt_group)
@@ -299,6 +297,9 @@ class MainWindow(QMainWindow):
         virt_layout.addWidget(self._virt_status_label)
 
         layout.addWidget(virt_group)
+
+        # Initial device enumeration (must happen after all combos are created)
+        self._refresh_audio_devices()
 
         layout.addStretch()
         return widget
